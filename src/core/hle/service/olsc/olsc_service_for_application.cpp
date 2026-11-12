@@ -18,7 +18,7 @@ namespace Island = NextendoIsland;
 
 namespace olsc_app_detail {
 
-Result ToResult(Island::Outcome outcome) {
+static Result ToResult(Island::Outcome outcome) {
     switch (outcome) {
     case Island::Outcome::Ok:
     case Island::Outcome::Unchanged:
@@ -36,7 +36,7 @@ Result ToResult(Island::Outcome outcome) {
     }
 }
 
-bool IsNullUid(const NS::Uid& uid) {
+static bool IsNullUid(const NS::Uid& uid) {
     return uid.uuid.IsInvalid();
 }
 

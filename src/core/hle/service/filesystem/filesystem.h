@@ -79,6 +79,8 @@ public:
     void SetPackedUpdate(ProcessId process_id, FileSys::VirtualFile update_raw);
 
     std::shared_ptr<SaveDataController> OpenSaveDataController();
+    // [Nextendo] Public so the cloud save sync can locate a title's save directory.
+    std::shared_ptr<FileSys::SaveDataFactory> CreateSaveDataFactory(ProgramId program_id);
 
     Result OpenSDMC(FileSys::VirtualDir* out_sdmc) const;
     Result OpenBISPartition(FileSys::VirtualDir* out_bis_partition,
@@ -130,7 +132,6 @@ public:
     void Reset();
 
 private:
-    std::shared_ptr<FileSys::SaveDataFactory> CreateSaveDataFactory(ProgramId program_id);
 
     struct Registration {
         ProgramId program_id;

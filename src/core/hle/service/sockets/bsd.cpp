@@ -1151,7 +1151,8 @@ std::pair<s32, Errno> BSD::SocketImpl(Domain domain, Type type, Protocol protoco
     LOG_INFO(Service, "New socket fd={}", fd);
 
     auto room_member = Network::GetRoomMember().lock();
-    if (room_member && room_member->IsConnected()) {
+    const bool is_host_socket = !(room_member && room_member->IsConnected());
+    if (!is_host_socket) {
         descriptor.socket = std::make_shared<Network::ProxySocket>();
     } else {
         descriptor.socket = std::make_shared<Network::Socket>();
@@ -1169,7 +1170,7 @@ std::pair<s32, Errno> BSD::SocketImpl(Domain domain, Type type, Protocol protoco
     }
 
     // [Nextendo] Only for real host sockets (not the LDN room proxy).
-    if (dynamic_cast<Network::Socket*>(descriptor.socket.get()) != nullptr) {
+    if (is_host_socket) {
         if (type == Type::DGRAM) {
             // Guest P2P (Pia) traffic can arrive as a burst of several large datagrams within
             // single-digit milliseconds of each other (observed: a friend-island-visit payload

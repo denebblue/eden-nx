@@ -1636,7 +1636,6 @@ Result Module::Interface::InitializeApplicationInfoBase() {
 
     LOG_WARNING(Service_ACC, "ApplicationInfo init required");
     // TODO(ogniK): Actual initialization here
-    case FileSys::StorageId::NandSystem:
 
     return ResultSuccess;
 }

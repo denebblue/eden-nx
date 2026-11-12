@@ -148,8 +148,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Built-in Nextendo title patches, before mods so a test mod layers on top.
     if (pm) {
-        std::span<u8> section(program_image.data() + module_start,
-                              program_image.size() - module_start);
+        std::span<u8> section(codeset.memory.data() + module_start,
+                              codeset.memory.size() - module_start);
         std::vector<u8> image(sizeof(NSOHeader) + section.size());
         std::memcpy(image.data(), &nso_header, sizeof(NSOHeader));
         std::memcpy(image.data() + sizeof(NSOHeader), section.data(), section.size());
@@ -191,8 +191,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 #endif
     if (pm && (catalog_patch || pm->GetTitleID() == CtrTitleId ||
                pm->GetTitleID() == 0x0100EA6014BB8000ULL)) {
-        std::span<u8> patchable_section(program_image.data() + module_start,
-                                        program_image.size() - module_start);
+        std::span<u8> patchable_section(codeset.memory.data() + module_start,
+                                        codeset.memory.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
         std::memcpy(pi_header.data(), &nso_header, sizeof(NSOHeader));
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
