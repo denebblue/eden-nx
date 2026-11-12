@@ -63,7 +63,7 @@ jobs:
             -DENABLE_QT_TRANSLATION=OFF
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel -- -k 0
 
       - name: Package
         shell: pwsh
