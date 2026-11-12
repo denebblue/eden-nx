@@ -17,7 +17,11 @@ namespace FileSys {
 namespace {
 
 bool ShouldSaveDataBeAutomaticallyCreated(SaveDataSpaceId space, const SaveDataAttribute& attr) {
+    // [Nextendo] SaveDataType::Bcat is auto-created on first open: a real console provisions
+    // each title's BCAT delivery-cache storage at first launch, and Splatoon 3 retries forever
+    // against a missing one (see Ryujinx-Nextendo df268d0, EnsureApplicationBcatDeliveryCacheStorage).
     return attr.type == SaveDataType::Cache || attr.type == SaveDataType::Temporary ||
+           attr.type == SaveDataType::Bcat ||
            (space == SaveDataSpaceId::User && ///< Normal Save Data -- Current Title & User
             (attr.type == SaveDataType::Account || attr.type == SaveDataType::Device) &&
             attr.program_id == 0 && attr.system_save_data_id == 0);
@@ -141,6 +145,9 @@ std::string SaveDataFactory::GetFullPath(ProgramId program_id, VirtualDir dir,
                            title_id);
     case SaveDataType::Cache:
         return fmt::format("{}save/cache/{:016X}", out, title_id);
+    case SaveDataType::Bcat:
+        // [Nextendo] Same location Citron uses for BCAT delivery-cache storage.
+        return fmt::format("{}save/unknown_{:X}/{:016X}", out, static_cast<u8>(type), title_id);
     default:
         ASSERT_MSG(false, "Unrecognized SaveDataType: {:02X}", static_cast<u8>(type));
         return fmt::format("{}save/unknown_{:X}/{:016X}", out, static_cast<u8>(type), title_id);
@@ -192,6 +199,43 @@ void SaveDataFactory::WriteSaveDataSize(SaveDataType type, u64 title_id, u128 us
 
 void SaveDataFactory::SetAutoCreate(bool state) {
     auto_create = state;
+}
+
+VirtualDir SaveDataFactory::GetTitleSaveDirectory(u64 title_id) const {
+    if (!dir) {
+        return nullptr;
+    }
+
+    VirtualDir user_save_root = dir->GetDirectoryRelative("user/save/0000000000000000");
+    if (!user_save_root) {
+        user_save_root = dir->GetDirectoryRelative("user/save");
+    }
+    if (!user_save_root) {
+        return nullptr;
+    }
+
+    const std::string title_id_str = fmt::format("{:016X}", title_id);
+    for (const auto& profile_dir : user_save_root->GetSubdirectories()) {
+        if (!profile_dir) {
+            continue;
+        }
+        auto save_dir = profile_dir->GetDirectoryRelative(title_id_str);
+        if (!save_dir) {
+            for (const auto& sub : profile_dir->GetSubdirectories()) {
+                if (!sub) {
+                    continue;
+                }
+                save_dir = sub->GetDirectoryRelative(title_id_str);
+                if (save_dir) {
+                    break;
+                }
+            }
+        }
+        if (save_dir) {
+            return save_dir;
+        }
+    }
+    return nullptr;
 }
 
 } // namespace FileSys

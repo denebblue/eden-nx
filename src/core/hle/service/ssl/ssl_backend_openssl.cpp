@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
+#include <string_view>
+#include <vector>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -15,6 +17,7 @@
 #include "common/hex_util.h"
 #include "common/string_util.h"
 
+#include "core/hle/service/sockets/sfdnsres.h"
 #include "core/hle/service/ssl/ssl_backend.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/sockets.h"
@@ -115,6 +118,26 @@ inline void LoadCaCertStore(SSL_CTX* ctx, const char* ca_cert, std::size_t size)
 }
 #endif
 
+// [Nextendo] NPLN (Splatoon 3's gRPC/HTTP2 stack) needs h2; everyone else needs http/1.1-only
+// (NEX rides a WebSocket Upgrade that h2 breaks). Substring match: NPLN's session transport
+// connects via SNI "gs.nintendo.net", which doesn't contain "npln".
+bool IsNplnHost(std::string_view hostname) {
+    const std::string lower = Common::ToLower(std::string(hostname));
+    return lower.find("npln") != std::string::npos || lower.find("gs.nintendo.net") != std::string::npos;
+}
+
+std::vector<unsigned char> BuildAlpnWire(std::span<const std::string> protocols) {
+    std::vector<unsigned char> wire;
+    for (const std::string& proto : protocols) {
+        if (proto != "h2" && proto != "http/1.1") {
+            continue;
+        }
+        wire.push_back(static_cast<unsigned char>(proto.size()));
+        wire.insert(wire.end(), proto.begin(), proto.end());
+    }
+    return wire;
+}
+
 } // namespace
 
 class SSLConnectionBackendOpenSSL final : public SSLConnectionBackend {
@@ -158,44 +181,90 @@ public:
     }
 
     Result SetHostName(const std::string& hostname) override {
-        if (!skip_cert_verification) {
-            if (!SSL_set1_host(ssl, hostname.c_str())) {
-                LOG_ERROR(Service_SSL, "SSL_set1_host({}) failed", hostname);
-                return CheckOpenSSLErrors();
+        std::string effective_host = hostname;
+        auto pos = effective_host.find('%');
+        if (pos != std::string::npos) {
+            effective_host.replace(pos, 1, "lp1");
+        }
+        if (socket) {
+            auto [peer_addr, err] = socket->GetPeerName();
+            if (err == Network::Errno::SUCCESS) {
+                std::string ip_str = Network::IPv4AddressToString(peer_addr.ip);
+                // Some titles pass the redirected IP itself instead of leaving this empty.
+                if (effective_host.empty() || effective_host == ip_str) {
+                    std::string last_host = Service::Sockets::GetLastHostForIp(ip_str);
+                    if (!last_host.empty()) {
+                        effective_host = last_host;
+                        auto pos2 = effective_host.find('%');
+                        if (pos2 != std::string::npos) {
+                            effective_host.replace(pos2, 1, "lp1");
+                        }
+                        LOG_INFO(Service_SSL, "[Nextendo] Recovered host '{}' for IP {}",
+                                 effective_host, ip_str);
+                    }
+                }
             }
         }
-        if (!SSL_set_tlsext_host_name(ssl, hostname.c_str())) { // hostname for SNI
-            LOG_ERROR(Service_SSL, "SSL_set_tlsext_host_name({}) failed", hostname);
-            return CheckOpenSSLErrors();
+        if (!effective_host.empty()) {
+            // Certificate verification is always bypassed (see SetVerifyOption), so this only
+            // records the name; a mismatch never fails the handshake.
+            if (!SSL_set1_host(ssl, effective_host.c_str())) {
+                LOG_ERROR(Service_SSL, "SSL_set1_host({}) failed", effective_host);
+                return CheckOpenSSLErrors();
+            }
+            if (!SSL_set_tlsext_host_name(ssl, effective_host.c_str())) { // hostname for SNI
+                LOG_ERROR(Service_SSL, "SSL_set_tlsext_host_name({}) failed", effective_host);
+                return CheckOpenSSLErrors();
+            }
         }
         return ResultSuccess;
     }
 
     void SetVerifyOption(u32 option) override {
-        skip_cert_verification = (option == 0);
-        LOG_WARNING(Service_SSL, "option={} skip_verification={}", option,
-                    skip_cert_verification);
-        if (skip_cert_verification) {
-            SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
-            SSL_set1_host(ssl, nullptr);
-            SSL_set_hostflags(ssl, 0);
-        } else {
-            SSL_set_verify(ssl, SSL_VERIFY_PEER, nullptr);
-        }
+        // [Nextendo] Always bypass certificate verification for self-hosted/redirected servers
+        skip_cert_verification = true;
+        LOG_DEBUG(Service_SSL, "option={}, bypassing cert verification for Nextendo", option);
+        SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
     }
 
-    Result DoHandshake() override {
-        SSL_set_verify_result(ssl, X509_V_OK);
-        const int ret = SSL_do_handshake(ssl);
-
-        if (!skip_cert_verification) {
-            const long verify_result = SSL_get_verify_result(ssl);
-            if (verify_result != X509_V_OK) {
-                LOG_ERROR(Service_SSL, "SSL cert verification failed because: {}",
-                          X509_verify_cert_error_string(verify_result));
-                return CheckOpenSSLErrors();
+    Result DoHandshake(std::span<const std::string> requested_alpn_protos) override {
+        // If SNI host is not set, try recovering host from peer IP
+        if (socket && !SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)) {
+            auto [peer_addr, err] = socket->GetPeerName();
+            if (err == Network::Errno::SUCCESS) {
+                std::string ip_str = Network::IPv4AddressToString(peer_addr.ip);
+                std::string last_host = Service::Sockets::GetLastHostForIp(ip_str);
+                if (!last_host.empty()) {
+                    auto pos = last_host.find('%');
+                    if (pos != std::string::npos) {
+                        last_host.replace(pos, 1, "lp1");
+                    }
+                    LOG_INFO(Service_SSL, "[Nextendo] DoHandshake SNI injection host '{}' for IP {}",
+                             last_host, ip_str);
+                    SSL_set1_host(ssl, last_host.c_str());
+                    SSL_set_tlsext_host_name(ssl, last_host.c_str());
+                }
             }
         }
+
+        static constexpr unsigned char kHttp11Only[] = "\x08http/1.1";
+        std::vector<unsigned char> npln_wire;
+        const char* servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+        if (servername && IsNplnHost(servername)) {
+            npln_wire = BuildAlpnWire(requested_alpn_protos);
+        }
+        if (!npln_wire.empty()) {
+            LOG_INFO(Service_SSL, "[Nextendo] NPLN host '{}': honoring game-requested ALPN ({} byte(s))",
+                     servername, npln_wire.size());
+            SSL_set_alpn_protos(ssl, npln_wire.data(), static_cast<unsigned int>(npln_wire.size()));
+        } else {
+            SSL_set_alpn_protos(ssl, kHttp11Only, static_cast<unsigned int>(sizeof(kHttp11Only) - 1));
+        }
+
+        // Bypassing verification for Nextendo compatibility
+        SSL_set_verify(ssl, SSL_VERIFY_NONE, nullptr);
+        SSL_set_verify_result(ssl, X509_V_OK);
+        const int ret = SSL_do_handshake(ssl);
 
         if (ret <= 0) {
             const int ssl_err = SSL_get_error(ssl, ret);
@@ -213,9 +282,19 @@ public:
         return HandleReturn("SSL_read_ex", out_size, ret);
     }
 
+    Result Peek(size_t* out_size, std::span<u8> data) override {
+        const int ret = SSL_peek_ex(ssl, data.data(), data.size(), out_size);
+        return HandleReturn("SSL_peek_ex", out_size, ret);
+    }
+
     Result Write(size_t* out_size, std::span<const u8> data) override {
         const int ret = SSL_write_ex(ssl, data.data(), data.size(), out_size);
         return HandleReturn("SSL_write_ex", out_size, ret);
+    }
+
+    Result Pending(s32* out_pending) override {
+        *out_pending = SSL_pending(ssl);
+        return ResultSuccess;
     }
 
     Result HandleReturn(const char* what, size_t* actual, int ret) {

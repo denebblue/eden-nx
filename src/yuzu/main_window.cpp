@@ -42,6 +42,7 @@
 #include "applets/qt_profile_select.h"
 #include "applets/qt_software_keyboard.h"
 #include "applets/qt_web_browser.h"
+#include "applets/qt_friend_invitation.h"
 
 #include "configuration/configure_dialog.h"
 #include "configuration/configure_input.h"
@@ -1099,6 +1100,9 @@ void MainWindow::InitializeWidgets() {
                                              ui->action_Show_Room, *QtCommon::system);
     multiplayer_state->setVisible(false);
 
+    // [Nextendo] Account controller, notifications, pending island uploads.
+    NextendoInitialize();
+
     // Create status bar
     message_label = new QLabel();
     // Configured separately for left alignment
@@ -1689,6 +1693,9 @@ void MainWindow::ConnectMenuEvents() {
             &MultiplayerState::OnOpenNetworkRoom);
     connect(multiplayer_state, &MultiplayerState::SaveConfig, this, &MainWindow::OnSaveConfig);
 
+    // Nextendo
+    NextendoConnectMenu();
+
     // Tools
     connect_menu(ui->action_Launch_PhotoViewer, [this] {
         LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::PhotoViewer), std::nullopt);
@@ -1906,6 +1913,9 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         return false;
     }
 
+    // [Nextendo] Online patches (NPLN) are resolved before any NSO is loaded.
+    NextendoPrepareOnlinePatches(filename, params);
+
     QtCommon::system->SetFilesystem(QtCommon::vfs);
 
     if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
@@ -1925,12 +1935,15 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
         std::make_unique<QtSoftwareKeyboard>(*this),         // Software Keyboard
         std::make_unique<QtWebBrowser>(*this),               // Web Browser
         nullptr,                                             // Net Connect
+        std::make_unique<QtFriendInvitation>(this),          // [Nextendo] Friend invitations
     });
 
     /** firmware check */
 
-    if (!QtCommon::Content::CheckGameFirmware(params.program_id))
+    if (!QtCommon::Content::CheckGameFirmware(params.program_id)) {
+        NextendoLoadFailed();
         return false;
+    }
 
     /** Exec */
     const Core::SystemResultStatus result{
@@ -1995,6 +2008,7 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
             }
             break;
         }
+        NextendoLoadFailed();
         return false;
     }
     current_game_path = filename;
@@ -2070,6 +2084,14 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     const auto loader =
         Loader::GetLoader(*QtCommon::system, v_file, params.program_id, params.program_index);
 
+    if (loader != nullptr) {
+        loader->ReadProgramId(title_id);
+    }
+    // [Nextendo] Splatoon 3 mod check, online schedule/BCAT refresh, cloud save pull.
+    if (!NextendoBeforeBoot(title_id)) {
+        return;
+    }
+
     if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
         type == StartGameType::Normal) {
         // Load per game settings
@@ -2079,6 +2101,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                           ? Common::FS::PathToUTF8String(file_path.filename())
                                           : fmt::format("{:016X}", title_id);
         QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
+        NextendoApplyPerGameWorkarounds(title_id);
         QtCommon::system->HIDCore().ReloadInputDevices();
         QtCommon::system->ApplySettings();
     }
@@ -2176,6 +2199,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                      .toStdString();
     LOG_INFO(Frontend, "Booting game: {:016X} | {} | {}", title_id, title_name, title_version);
     const auto gpu_vendor = QtCommon::system->GPU().Renderer().GetDeviceVendor();
+    NextendoOnGameBooted(metadata.first != nullptr ? metadata.first->GetApplicationName()
+                                                   : title_name);
     UpdateWindowTitle(title_name, title_version, gpu_vendor);
 
     loading_screen->Prepare(QtCommon::system->GetAppLoader());
@@ -2267,6 +2292,10 @@ void MainWindow::OnEmulationStopped() {
         emu_thread->wait();
         emu_thread.reset();
     }
+
+    // [Nextendo] Play time to the account history, presence back to online, NPLN patches off,
+    // cloud save upload, Animal Crossing island upload.
+    NextendoOnEmulationStopped();
 
     if (shutdown_dialog) {
         shutdown_dialog->deleteLater();
@@ -3149,6 +3178,7 @@ void MainWindow::OnStartGame() {
 
     play_time_manager->SetProgramId(QtCommon::system->GetApplicationProcessProgramID());
     play_time_manager->Start();
+    NextendoOnStartGame();
 
     discord_rpc->Update();
     Common::FeralGamemode::Start();
@@ -4665,9 +4695,11 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     game_list->UnloadController();
 
     // Shutdown session if the emu thread is active...
+    NextendoOnClose();
     if (emu_thread != nullptr) {
         ShutdownGame();
     }
+    NextendoAfterShutdownOnClose();
 
     render_window->close();
     multiplayer_state->Close();

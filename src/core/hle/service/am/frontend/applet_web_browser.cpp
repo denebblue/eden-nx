@@ -4,6 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+#include <string_view>
+#include <vector>
+
 #include "common/assert.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
@@ -20,6 +25,7 @@
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/system_archive/system_archive.h"
 #include "core/file_sys/vfs/vfs_vector.h"
+#include "core/frontend/applets/error.h"
 #include "core/frontend/applets/web_browser.h"
 #include "core/hle/result.h"
 #include "core/hle/service/am/am.h"
@@ -49,6 +55,78 @@ T ParseRawValue(std::span<const u8> data) {
 
 std::string ParseStringValue(std::span<const u8> data) {
     return Common::StringFromFixedZeroTerminatedBuffer(reinterpret_cast<const char*>(data.data()), data.size());
+}
+
+bool IsPokemonTermsTitle(u64 program_id) {
+    return program_id == 0x01008F6008C5E000ULL || program_id == 0x0100A3D008C5C000ULL ||
+           program_id == 0x0100F43008C44000ULL;
+}
+
+// Battle Stadium, competition entry (Scarlet/Violet, /scvi/) and Ranked Battles (Legends: Z-A,
+// /plza/) open a terms page on battle-*.pokemon-home.com and wait for its callback; honor only a
+// callback in the same page directory on the same origin.
+bool IsPokemonTermsCallback(std::string_view initial_url, std::string_view callback_url) {
+    constexpr std::string_view scheme = "https://";
+    if (!initial_url.starts_with("https://battle-")) {
+        return false;
+    }
+    const auto path_start = initial_url.find('/', scheme.size());
+    if (path_start == std::string_view::npos ||
+        !initial_url.substr(0, path_start).ends_with(".pokemon-home.com") ||
+        !(initial_url.substr(path_start).starts_with("/scvi/") ||
+          initial_url.substr(path_start).starts_with("/plza/"))) {
+        return false;
+    }
+    const auto page = initial_url.substr(0, initial_url.find('?'));
+    return callback_url == std::string{page.substr(0, page.rfind('/'))} + "/callback";
+}
+
+// Output TLVs, which 8.0.0+ Web and 3.0.0+ Share applets return instead of WebCommonReturnValue.
+std::vector<u8> BuildWebOutputTlvs(ShimKind shim_kind, WebExitReason exit_reason,
+                                   std::string_view last_url) {
+    std::vector<u8> url(last_url.begin(), last_url.end());
+    url.push_back(0); // The reported size includes the terminator.
+
+    std::vector<u8> out;
+    const auto append = [&out](const auto& value) {
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        out.insert(out.end(), bytes, bytes + sizeof(value));
+    };
+    const auto append_tlv = [&](WebArgOutputTLVType type, std::span<const u8> data) {
+        WebArgOutputTLV tlv{};
+        tlv.output_tlv_type = type;
+        tlv.arg_data_size = static_cast<u16>(data.size());
+        append(tlv);
+        out.insert(out.end(), data.begin(), data.end());
+    };
+
+    WebArgHeader header{};
+    header.total_tlv_entries = last_url.empty() ? 1 : 3;
+    header.shim_kind = shim_kind;
+    append(header);
+
+    const auto reason = static_cast<u32>(exit_reason);
+    append_tlv(WebArgOutputTLVType::ShareExitReason,
+               {reinterpret_cast<const u8*>(&reason), sizeof(reason)});
+    if (!last_url.empty()) {
+        const u64 url_size = url.size();
+        append_tlv(WebArgOutputTLVType::LastURL, url);
+        append_tlv(WebArgOutputTLVType::LastURLSize,
+                   {reinterpret_cast<const u8*>(&url_size), sizeof(url_size)});
+    }
+    // The SDK reads the output as one fixed 0x2000-byte storage.
+    out.resize((std::max)(out.size(), size_t{0x2000}));
+    return out;
+}
+
+// Ends a Pokémon terms page on its callback; accepting the terms goes to /agree.
+std::vector<u8> BuildPokemonTermsResponse(std::string callback_url) {
+    if (callback_url.ends_with("/terms/callback") ||
+        callback_url.ends_with("/scvi/battle-terms/callback") ||
+        callback_url.ends_with("/scvi/competition/callback")) {
+        callback_url += "/agree";
+    }
+    return BuildWebOutputTlvs(ShimKind::Web, WebExitReason::CallbackURL, callback_url);
 }
 
 std::string GetMainURL(const std::string& url) {
@@ -599,6 +677,22 @@ void WebBrowser::ExecuteShare() {
 }
 
 void WebBrowser::ExecuteWeb() {
+    if (web_applet_version >= WebAppletVersion::Version524288 &&
+        IsPokemonTermsTitle(system.GetApplicationProcessProgramID())) {
+        const auto initial_url = ParseStringValue(
+            GetInputTLVData(WebArgInputTLVType::InitialURL).value_or(std::vector<u8>{}));
+        const auto callback_url = ParseStringValue(
+            GetInputTLVData(WebArgInputTLVType::CallbackURL).value_or(std::vector<u8>{}));
+        if (IsPokemonTermsCallback(initial_url, callback_url)) {
+            LOG_INFO(Service_AM, "Pokémon terms page answered with its callback");
+            complete = true;
+            PushOutData(
+                std::make_shared<IStorage>(system, BuildPokemonTermsResponse(callback_url)));
+            Exit();
+            return;
+        }
+    }
+
     LOG_INFO(Service_AM, "Opening external URL at {}", external_url);
 
     frontend.OpenExternalWebPage(external_url,
@@ -613,7 +707,14 @@ void WebBrowser::ExecuteWifi() {
 }
 
 void WebBrowser::ExecuteLobby() {
+    // [Nextendo] NSO voice-chat lounge page; needs the phone app, so tell the player why.
     LOG_WARNING(Service_AM, "(STUBBED) called, Lobby Applet is not implemented");
+    if (const auto& error = system.GetFrontendAppletHolder().GetFrontendAppletSet().error) {
+        error->ShowCustomErrorText(
+            ResultSuccess,
+            "Voice chat isn't supported here — it requires the Nintendo Switch Online phone app.",
+            "Turn OFF voice chat in this game's settings, then host or join again.", [] {});
+    }
     WebBrowserExit(WebExitReason::EndButtonPressed);
 }
 

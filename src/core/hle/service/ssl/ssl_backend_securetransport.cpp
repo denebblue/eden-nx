@@ -110,7 +110,7 @@ public:
         }
     }
 
-    Result DoHandshake() override {
+    Result DoHandshake(std::span<const std::string> /*requested_alpn_protos*/) override {
         OSStatus status = SSLHandshake(context);
 
         if (skip_cert_verification && status == errSSLServerAuthCompleted) {
@@ -129,6 +129,13 @@ public:
     Result Write(size_t* out_size, std::span<const u8> data) override {
         OSStatus status = SSLWrite(context, data.data(), data.size(), out_size);
         return HandleReturn("SSLWrite", out_size, status);
+    }
+
+    Result Pending(s32* out_pending) override {
+        size_t buffered = 0;
+        SSLGetBufferedReadSize(context, &buffered);
+        *out_pending = static_cast<s32>(buffered);
+        return ResultSuccess;
     }
 
     Result HandleReturn(const char* what, size_t* actual, OSStatus status) {

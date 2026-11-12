@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -21,8 +23,17 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/loader/nextendo_amongus_patch.h"
+#include "core/loader/nextendo_dungeons2_patch.h"
+#include "core/loader/nextendo_necrodancer_patch.h"
+#include "core/loader/nextendo_pvzbfn_patch.h"
+#include "core/loader/nextendo_s3_patches.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
+
+#ifdef ENABLE_WEB_SERVICE
+#include "web_service/npln_patch_catalog.h"
+#endif
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"
@@ -135,6 +146,25 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         codeset.segments[i].size = PageAlignSize(codeset.segments[i].size);
     }
 
+    // Built-in Nextendo title patches, before mods so a test mod layers on top.
+    if (pm) {
+        std::span<u8> section(program_image.data() + module_start,
+                              program_image.size() - module_start);
+        std::vector<u8> image(sizeof(NSOHeader) + section.size());
+        std::memcpy(image.data(), &nso_header, sizeof(NSOHeader));
+        std::memcpy(image.data() + sizeof(NSOHeader), section.data(), section.size());
+        image = Loader::NextendoDungeons2Patch::ApplyIfMatch(pm->GetTitleID(),
+                                                             nso_header.build_id, std::move(image));
+        image = Loader::NextendoPvZBfNPatch::ApplyIfMatch(pm->GetTitleID(), nso_header.build_id,
+                                                          std::move(image));
+        image = Loader::NextendoAmongUsPatch::ApplyIfMatch(pm->GetTitleID(), std::move(image));
+        image = Loader::NextendoNecroDancerPatch::ApplyIfMatch(pm->GetTitleID(),
+                                                               nso_header.build_id, std::move(image));
+        if (image.size() == sizeof(NSOHeader) + section.size()) {
+            std::copy(image.begin() + sizeof(NSOHeader), image.end(), section.data());
+        }
+    }
+
     // Apply patches if necessary
     const auto name = nso_file.GetName();
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
@@ -147,6 +177,38 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         pi_header = pm->PatchNSO(pi_header, name);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // Apply the launch-fixed signed catalog entry independently of user mod patches.
+    // CTR/Demonware retains its separate built-in fallback.
+    constexpr u64 CtrTitleId = 0x0100F9F00C696000ULL;
+    bool catalog_patch = false;
+#ifdef ENABLE_WEB_SERVICE
+    if (pm) {
+        catalog_patch = WebService::NplnPatchCatalog::HasEntry(pm->GetTitleID(),
+            Common::HexToString(nso_header.build_id), name);
+    }
+#endif
+    if (pm && (catalog_patch || pm->GetTitleID() == CtrTitleId ||
+               pm->GetTitleID() == 0x0100EA6014BB8000ULL)) {
+        std::span<u8> patchable_section(program_image.data() + module_start,
+                                        program_image.size() - module_start);
+        std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
+        std::memcpy(pi_header.data(), &nso_header, sizeof(NSOHeader));
+        std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
+                    patchable_section.size());
+
+        pi_header = Loader::NextendoS3Patches::ApplyIfMatch(nso_header.build_id,
+                                                            std::move(pi_header), name, pm->GetTitleID());
+
+        if (pi_header.size() >= sizeof(NSOHeader) &&
+            pi_header.size() - sizeof(NSOHeader) == patchable_section.size()) {
+            std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(),
+                      patchable_section.data());
+        } else {
+            LOG_ERROR(Loader, "[Nextendo] Online patch changed the image size "
+                              "unexpectedly; skipped");
+        }
     }
 
 #ifdef HAS_NCE
@@ -244,6 +306,17 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
 
 ResultStatus AppLoader_NSO::ReadNSOModules(Modules& out_modules) {
     out_modules = this->modules;
+    return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_NSO::ReadMainBuildId(Core::System& system,
+                                          std::array<u8, 0x20>& build_id) {
+    NSOHeader header{};
+    if (!file || file->ReadObject(&header) != sizeof(header) ||
+        IdentifyType(file) != FileType::NSO) {
+        return ResultStatus::ErrorLoadingNSO;
+    }
+    build_id = header.build_id;
     return ResultStatus::Success;
 }
 

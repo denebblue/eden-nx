@@ -1,0 +1,150 @@
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <span>
+#include <string_view>
+
+#include "common/hex_util.h"
+#include "common/logging.h"
+#include "core/file_sys/ips_layer.h"
+#include "core/file_sys/vfs/vfs_vector.h"
+#include "core/loader/nextendo_s3_patches.h"
+#include "core/loader/nextendo_jd22_patch.h"
+
+#ifdef ENABLE_WEB_SERVICE
+#include "web_service/npln_patch_catalog.h"
+#endif
+
+namespace Loader::NextendoS3Patches {
+
+namespace {
+
+// NPLN game patches are supplied only by the verified catalog.
+// CTR uses Demonware and retains its independent built-in patches.
+
+// Crash Team Racing Nitro-Fueled v1.0.15, build 1C689518406930512C13DDF4217E7676.
+// Replaces the embedded Demonware RSA public key so signed Nextendo auth replies verify.
+constexpr std::array<u8, 309> kCtrServerTrust{{
+    0x49, 0x50, 0x53, 0x33, 0x32, 0x04, 0x0B, 0x4E, 0x40, 0x01, 0x26, 0x30,
+    0x82, 0x01, 0x22, 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7,
+    0x0D, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0F, 0x00, 0x30,
+    0x82, 0x01, 0x0A, 0x02, 0x82, 0x01, 0x01, 0x00, 0x8E, 0x5C, 0xA5, 0x67,
+    0x83, 0xF1, 0x12, 0x87, 0xFF, 0xA2, 0x81, 0x26, 0x99, 0x4E, 0xE0, 0x0E,
+    0x79, 0xC0, 0x3A, 0x02, 0x7D, 0x35, 0x31, 0x0E, 0x73, 0xF0, 0x7D, 0xA4,
+    0xFD, 0xF8, 0x95, 0x97, 0xA4, 0xF6, 0x78, 0xE2, 0x21, 0xDA, 0x65, 0x75,
+    0x52, 0xCE, 0xDF, 0xDF, 0x77, 0xF2, 0x01, 0x36, 0x33, 0x02, 0x7B, 0x34,
+    0x21, 0xEE, 0xA8, 0x24, 0x4C, 0x15, 0x12, 0x5D, 0x6E, 0x3F, 0xEB, 0x08,
+    0xA9, 0xD9, 0xF0, 0x02, 0x05, 0x5E, 0x9A, 0x32, 0x1F, 0xD6, 0x94, 0x3F,
+    0x47, 0x45, 0x5C, 0x4B, 0x50, 0x49, 0xC1, 0xD8, 0x2D, 0x47, 0x19, 0x4D,
+    0x6E, 0x09, 0xA7, 0x02, 0x98, 0xA9, 0x3B, 0x99, 0x45, 0x26, 0xA8, 0x97,
+    0x8F, 0x66, 0x63, 0x79, 0xEF, 0x1A, 0x0A, 0x5B, 0xD5, 0x75, 0xC0, 0x51,
+    0x5E, 0xEC, 0x51, 0x15, 0xB1, 0x8C, 0x1E, 0x6D, 0x43, 0xB4, 0x35, 0x74,
+    0xA5, 0xA0, 0xED, 0x21, 0x0A, 0x83, 0x1D, 0xB8, 0xA7, 0x10, 0xDC, 0xCC,
+    0x61, 0x56, 0x2A, 0xB1, 0xAD, 0xC2, 0x15, 0xAE, 0x4A, 0x00, 0xA5, 0x12,
+    0xA0, 0xD8, 0x51, 0xF0, 0xF5, 0x84, 0x05, 0x22, 0x05, 0x3E, 0x9D, 0x1A,
+    0xBE, 0xE5, 0xF5, 0x65, 0xA8, 0x00, 0xAB, 0xF6, 0xD0, 0x57, 0x72, 0x7B,
+    0x69, 0xFF, 0x48, 0x12, 0x56, 0x5C, 0xF5, 0x5E, 0x74, 0x7A, 0xB6, 0x9C,
+    0x6E, 0x94, 0xEA, 0x36, 0xCA, 0x58, 0x0C, 0xA9, 0xD8, 0x9F, 0xC6, 0x08,
+    0x92, 0x84, 0x47, 0xE2, 0xBA, 0xCB, 0x78, 0xB7, 0x16, 0xAD, 0x01, 0xC8,
+    0xF3, 0x46, 0xAE, 0x0F, 0x70, 0x81, 0x96, 0xAE, 0xB3, 0x6D, 0x5C, 0x5D,
+    0x92, 0xA5, 0xBC, 0x9B, 0x92, 0xCE, 0xA4, 0xC9, 0x51, 0xB2, 0x79, 0x15,
+    0xCF, 0x69, 0x07, 0xFC, 0x43, 0xD6, 0xA3, 0xF4, 0xD4, 0x38, 0x9B, 0x1D,
+    0x6F, 0xE2, 0x0C, 0xA2, 0x43, 0x52, 0xD1, 0x99, 0xF2, 0x0F, 0xE6, 0x63,
+    0x02, 0x03, 0x01, 0x00, 0x01, 0x45, 0x45, 0x4F, 0x46,
+}};
+
+// maxUserIdsPerQuery at 0xa8f1e0: MOV W8,#20 -> MOV W8,#300, so friend room lookups see past
+// the first 20 entries of CTR's alphabetically sorted list.
+constexpr std::array<u8, 19> kCtrFriendLookup{{
+    0x49, 0x50, 0x53, 0x33, 0x32, 0x00, 0xA8, 0xF2, 0xE0, 0x00, 0x04, 0x88,
+    0x25, 0x80, 0x52, 0x45, 0x45, 0x4F, 0x46,
+}};
+
+struct KnownBuild {
+    std::string_view build_id_hex; // Uppercase, trailing zero bytes stripped -- same convention
+                                    // PatchManager::PatchNSO already uses for build_id matching.
+    std::span<const std::span<const u8>> patches;
+};
+
+constexpr std::array<std::span<const u8>, 2> kCtrPatches{{kCtrServerTrust, kCtrFriendLookup}};
+
+constexpr std::array<KnownBuild, 1> kKnownBuilds{{
+    {"1C689518406930512C13DDF4217E7676", kCtrPatches},
+}};
+
+FileSys::VirtualFile MakeIpsFile(std::span<const u8> bytes) {
+    return std::make_shared<FileSys::VectorVfsFile>(std::vector<u8>(bytes.begin(), bytes.end()),
+                                                     "nextendo_s3.ips32");
+}
+
+// Applies one patch, logging (not throwing) on failure -- a patch that can't apply shouldn't
+// stop the game from booting at all, just from working online, same as a bad exefs_patches file
+// would silently no-op today.
+std::vector<u8> ApplyOne(std::vector<u8> nso, std::span<const u8> ips_bytes, size_t index, bool* applied = nullptr) {
+    if (applied) {
+        *applied = false;
+    }
+
+    auto in_file = std::make_shared<FileSys::VectorVfsFile>(nso, "nso");
+    const auto patched = FileSys::PatchIPS(in_file, MakeIpsFile(ips_bytes));
+    if (patched == nullptr) {
+        LOG_ERROR(Loader, "[Nextendo] Online patch #{} failed to apply", index);
+        return nso;
+    }
+    if (applied) {
+        *applied = true;
+    }
+    return patched->ReadAllBytes();
+}
+
+} // namespace
+
+std::vector<u8> ApplyIfMatch(const std::array<u8, 0x20>& build_id, std::vector<u8> nso,
+                             std::string_view module_name, u64 title_id) {
+    const auto build_id_raw = Common::HexToString(build_id);
+    if (nso.size() >= 0x100 && NextendoJd22::Apply(title_id, build_id_raw, module_name,
+                                                std::span<u8>(nso).subspan(0x100))) {
+        LOG_INFO(Loader, "[Nextendo] JD2022 exact-build TLS trust applied");
+        return nso;
+    }
+#ifdef ENABLE_WEB_SERVICE
+    const auto catalog = WebService::NplnPatchCatalog::Find(title_id, build_id_raw, module_name, nso);
+    if (catalog.authoritative) {
+        if (catalog.ips.empty()) {
+            return nso;
+        }
+
+        bool applied = false;
+        auto patched = ApplyOne(std::move(nso), catalog.ips, 0, &applied);
+        if (applied) {
+            LOG_INFO(Loader, "[Nextendo] NPLN: catalog patch {} version {} applied (build {})",
+                     catalog.id, catalog.version, build_id_raw);
+        }
+        return patched;
+    }
+#endif
+    // Never fall back to built-in bytes for an NPLN game or another module.
+    if (title_id != 0x0100F9F00C696000ULL || module_name != "main") {
+        return nso;
+    }
+    const auto build_id_hex = build_id_raw.substr(0, build_id_raw.find_last_not_of('0') + 1);
+
+    for (const auto& known : kKnownBuilds) {
+        if (build_id_hex != known.build_id_hex) {
+            continue;
+        }
+
+        for (size_t i = 0; i < known.patches.size(); ++i) {
+            nso = ApplyOne(std::move(nso), known.patches[i], i);
+        }
+
+        LOG_INFO(Loader, "[Nextendo] CTR: {} built-in patch(es) applied (build {})",
+                 known.patches.size(), build_id_hex);
+        return nso;
+    }
+
+    LOG_WARNING(Loader, "[Nextendo] No online patch available for CTR build {}", build_id_raw);
+    return nso;
+}
+
+} // namespace Loader::NextendoS3Patches

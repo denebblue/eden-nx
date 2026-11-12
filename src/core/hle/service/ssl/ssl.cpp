@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+
+#include "common/hex_util.h"
 #include "common/string_util.h"
 
 #include "core/core.h"
@@ -14,9 +18,12 @@
 #include "core/hle/service/service.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/sockets/bsd.h"
+#include "core/hle/service/sockets/nextendo_uch.h"
 #include "core/hle/service/ssl/cert_store.h"
+#include "core/hle/service/ssl/nextendo_nat_rewrite.h"
 #include "core/hle/service/ssl/ssl.h"
 #include "core/hle/service/ssl/ssl_backend.h"
+#include "core/hle/service/ssl/ssl_pending_registry.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/sockets.h"
 
@@ -88,8 +95,8 @@ public:
             {10, &ISslConnection::Read, "Read"},
             {11, &ISslConnection::Write, "Write"},
             {12, &ISslConnection::Pending, "Pending"},
-            {13, nullptr, "Peek"},
-            {14, nullptr, "Poll"},
+            {13, &ISslConnection::Peek, "Peek"},
+            {14, &ISslConnection::Poll, "Poll"},
             {15, nullptr, "GetVerifyCertError"},
             {16, nullptr, "GetNeededServerCertBufferSize"},
             {17, &ISslConnection::SetSessionCacheMode, "SetSessionCacheMode"},
@@ -123,18 +130,21 @@ public:
 
     ~ISslConnection() {
         shared_data->connection_count--;
+        if (socket) {
+            UnregisterPendingCheck(socket.get());
+        }
+        // In Eden's SetSocketDescriptorImpl, fd_to_close is only set when do_not_close_socket is
+        // false: the connection then owns the duplicated fd and must close it here.
         if (fd_to_close.has_value()) {
             const s32 fd = *fd_to_close;
-            if (!do_not_close_socket) {
+            if (do_not_close_socket) {
                 LOG_ERROR(Service_SSL,
                           "do_not_close_socket was changed after setting socket; is this right?");
-            } else {
-                auto bsd = system.ServiceManager().GetService<Service::Sockets::BSD>("bsd:u");
-                if (bsd) {
-                    auto err = bsd->CloseImpl(fd);
-                    if (err != Service::Sockets::Errno::SUCCESS) {
-                        LOG_ERROR(Service_SSL, "Failed to close duplicated socket: {}", err);
-                    }
+            }
+            if (fd_to_close_bsd) {
+                auto err = fd_to_close_bsd->CloseImpl(fd);
+                if (err != Service::Sockets::Errno::SUCCESS) {
+                    LOG_ERROR(Service_SSL, "Failed to close duplicated socket: {}", err);
                 }
             }
         }
@@ -145,6 +155,7 @@ private:
     std::shared_ptr<SslContextSharedData> shared_data;
     std::unique_ptr<SSLConnectionBackend> backend;
     std::optional<int> fd_to_close;
+    std::shared_ptr<Service::Sockets::BSD> fd_to_close_bsd;
     bool do_not_close_socket = false;
     bool get_server_cert_chain = false;
     bool skip_default_verify = false;
@@ -153,12 +164,30 @@ private:
     std::vector<u8> next_alpn_proto;
     bool did_handshake = false;
     u32 verify_option = 0;
+    std::vector<std::string> requested_alpn_protos; // set via SetNextAlpnProto, see DoHandshakeImpl
+    // Ultimate Chicken Horse only: sees the login response of its service hosts to pick up the NXU1 ticket.
+    std::unique_ptr<Service::Sockets::NextendoUch::ResponseObserver> uch_response;
+
+    // fd's owning bsd:* port isn't known here; probe each instead of assuming "bsd:u".
+    std::shared_ptr<Service::Sockets::BSD> FindBsdServiceOwning(s32 fd) {
+        static constexpr std::array<const char*, 4> bsd_ports{"bsd:u", "bsd:s", "bsd:a", "bsd:nu"};
+        for (const char* port : bsd_ports) {
+            auto bsd = system.ServiceManager().GetService<Service::Sockets::BSD>(port);
+            if (bsd && bsd->GetSocket(fd).has_value()) {
+                return bsd;
+            }
+        }
+        return nullptr;
+    }
 
     Result SetSocketDescriptorImpl(s32* out_fd, s32 fd) {
         LOG_DEBUG(Service_SSL, "called, fd={}", fd);
         ASSERT(!did_handshake);
-        auto bsd = system.ServiceManager().GetService<Service::Sockets::BSD>("bsd:u");
-        ASSERT_OR_EXECUTE(bsd, { return ResultInternalError; });
+        auto bsd = FindBsdServiceOwning(fd);
+        if (!bsd) {
+            LOG_ERROR(Service_SSL, "invalid socket fd {}", fd);
+            return ResultInvalidSocket;
+        }
 
         auto res = bsd->DuplicateSocketImpl(fd);
         if (!res.has_value()) {
@@ -173,6 +202,7 @@ private:
         } else {
             *out_fd = -1;
             fd_to_close = duplicated_fd;
+            fd_to_close_bsd = bsd;
         }
 
         std::optional<std::shared_ptr<Network::SocketBase>> sock = bsd->GetSocket(duplicated_fd);
@@ -182,12 +212,25 @@ private:
         }
         socket = std::move(*sock);
         backend->SetSocket(socket);
+        // Lets bsd:u's Poll report readable when this connection has already decrypted more
+        // than the game's last Read() asked for -- the raw socket alone can't tell.
+        RegisterPendingCheck(socket.get(), [this] {
+            s32 pending = 0;
+            backend->Pending(&pending);
+            return pending;
+        });
         return ResultSuccess;
     }
 
     Result SetHostNameImpl(const std::string& hostname) {
         LOG_DEBUG(Service_SSL, "called. hostname={}", hostname);
         ASSERT(!did_handshake);
+        if (Service::Sockets::NextendoUch::IsTitle(system.GetApplicationProcessProgramID()) &&
+            Service::Sockets::NextendoUch::IsServiceHost(hostname)) {
+            uch_response = std::make_unique<Service::Sockets::NextendoUch::ResponseObserver>();
+        } else {
+            uch_response.reset();
+        }
         return backend->SetHostName(hostname);
     }
 
@@ -220,7 +263,7 @@ private:
 
     Result DoHandshakeImpl() {
         ASSERT_OR_EXECUTE(!did_handshake && socket, { return ResultNoSocket; });
-        Result res = backend->DoHandshake();
+        Result res = backend->DoHandshake(requested_alpn_protos);
         did_handshake = res.IsSuccess();
         return res;
     }
@@ -262,21 +305,36 @@ private:
         size_t actual_size{};
         Result res = backend->Read(&actual_size, *out_data);
         if (res != ResultSuccess) {
+            LOG_DEBUG(Service_SSL, "Read failed, res={}", res.raw);
             return res;
         }
         out_data->resize(actual_size);
+        if (uch_response && actual_size > 0) {
+            uch_response->Feed(*out_data);
+        }
+        LOG_DEBUG(Service_SSL, "Read {} bytes: {}", actual_size,
+                  Common::HexToString(*out_data, false));
         return res;
     }
 
     Result WriteImpl(size_t* out_size, std::span<const u8> data) {
         ASSERT_OR_EXECUTE(did_handshake, { return ResultInternalError; });
-        return backend->Write(out_size, data);
+
+        std::vector<u8> rewritten;
+        const bool did_rewrite = Service::SSL::TryFixupStationAddress(data, rewritten);
+        const std::span<const u8> send_data = did_rewrite ? std::span<const u8>(rewritten) : data;
+
+        const Result res = backend->Write(out_size, send_data);
+        if (did_rewrite && res.IsSuccess()) {
+            *out_size = data.size();
+        }
+        LOG_DEBUG(Service_SSL, "Write {} bytes, res={}: {}", *out_size, res.raw,
+                  Common::HexToString(send_data, false));
+        return res;
     }
 
     Result PendingImpl(s32* out_pending) {
-        LOG_WARNING(Service_SSL, "(STUBBED) called.");
-        *out_pending = 0;
-        return ResultSuccess;
+        return backend->Pending(out_pending);
     }
 
     void SetSocketDescriptor(HLERequestContext& ctx) {
@@ -415,12 +473,74 @@ private:
             enable_alpn = static_cast<bool>(parameters.value);
             break;
         default:
-            LOG_WARNING(Service_SSL, "Unknown option={}, value={}", parameters.option,
-                        parameters.value);
+            LOG_WARNING(Service_SSL, "Unknown option={}, value={}",
+                        static_cast<u32>(parameters.option), parameters.value);
         }
 
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
+    }
+
+    void Peek(HLERequestContext& ctx) {
+        // nn::websocket peeks the HTTP upgrade response; libcurl peeks 1 byte for liveness.
+        std::vector<u8> output_bytes(ctx.GetWriteBufferSize());
+        size_t actual_size{};
+        Result res = ResultInternalError;
+        if (did_handshake) {
+            res = backend->Peek(&actual_size, output_bytes);
+        }
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(res);
+        if (res == ResultSuccess) {
+            output_bytes.resize(actual_size);
+            rb.Push(static_cast<u32>(actual_size));
+            ctx.WriteBuffer(output_bytes);
+        } else {
+            rb.Push(static_cast<u32>(0));
+        }
+    }
+
+    void Poll(HLERequestContext& ctx) {
+        static constexpr u32 PollRead = 1, PollWrite = 2, PollExcept = 4;
+        IPC::RequestParser rp{ctx};
+        const u32 in_events = rp.Pop<u32>();
+        const u32 timeout_ms = rp.Pop<u32>();
+
+        u32 out_events = 0;
+        if (socket) {
+            s32 pending = 0;
+            backend->Pending(&pending);
+            if ((in_events & PollRead) && pending > 0) {
+                out_events |= PollRead;
+            }
+            Network::PollEvents wanted{};
+            if (in_events & PollRead) {
+                wanted |= Network::PollEvents::In;
+            }
+            if (in_events & PollWrite) {
+                wanted |= Network::PollEvents::Out;
+            }
+            std::vector<Network::PollFD> fds{{socket.get(), wanted, Network::PollEvents{}}};
+            // Bounded so an idle connection can't hold the ssl service thread; callers re-poll.
+            const s32 wait = out_events ? 0 : static_cast<s32>((std::min)(timeout_ms, 50u));
+            if (Network::Poll(fds, wait).first > 0) {
+                const Network::PollEvents revents = fds[0].revents;
+                if ((in_events & PollRead) &&
+                    True(revents & (Network::PollEvents::In | Network::PollEvents::Hup))) {
+                    out_events |= PollRead;
+                }
+                if ((in_events & PollWrite) && True(revents & Network::PollEvents::Out)) {
+                    out_events |= PollWrite;
+                }
+                if (True(revents & (Network::PollEvents::Err | Network::PollEvents::Nval))) {
+                    out_events |= PollExcept;
+                }
+            }
+        }
+
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(out_events);
     }
 
     void GetOption(HLERequestContext& ctx) {
@@ -459,7 +579,21 @@ private:
         const auto data = ctx.ReadBuffer(0);
         next_alpn_proto.assign(data.begin(), data.end());
 
-        LOG_DEBUG(Service_SSL, "SetNextAlpnProto called, size={}", next_alpn_proto.size());
+        // [Nextendo] Wire format: repeated [1-byte len][name]. Passed to DoHandshakeImpl.
+        requested_alpn_protos.clear();
+        size_t pos = 0;
+        while (pos < next_alpn_proto.size()) {
+            const u8 len = next_alpn_proto[pos++];
+            if (len == 0 || pos + len > next_alpn_proto.size()) {
+                break;
+            }
+            requested_alpn_protos.emplace_back(
+                reinterpret_cast<const char*>(next_alpn_proto.data() + pos), len);
+            pos += len;
+        }
+
+        LOG_INFO(Service_SSL, "SetNextAlpnProto called, size={}, parsed {} protocol(s)",
+                 next_alpn_proto.size(), requested_alpn_protos.size());
 
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
@@ -649,13 +783,19 @@ private:
         Out<u32> out_size, InArray<CaCertificateId, BufferAttr_HipcMapAlias> certificate_ids) {
         LOG_INFO(Service_SSL, "called");
         u32 num_entries;
-        R_RETURN(cert_store.GetCertificateBufSize(out_size, &num_entries, certificate_ids));
+        Result res = cert_store.GetCertificateBufSize(out_size, &num_entries, certificate_ids);
+        LOG_INFO(Service_SSL, "[Nextendo][DIAG] GetCertificateBufSize -> size={} num_entries={} requested_ids={}",
+                 *out_size, num_entries, certificate_ids.size());
+        R_RETURN(res);
     }
 
     Result GetCertificates(Out<u32> out_num_entries, OutBuffer<BufferAttr_HipcMapAlias> out_buffer,
                            InArray<CaCertificateId, BufferAttr_HipcMapAlias> certificate_ids) {
         LOG_INFO(Service_SSL, "called");
-        R_RETURN(cert_store.GetCertificates(out_num_entries, out_buffer, certificate_ids));
+        Result res = cert_store.GetCertificates(out_num_entries, out_buffer, certificate_ids);
+        LOG_INFO(Service_SSL, "[Nextendo][DIAG] GetCertificates -> num_entries={} requested_ids={}",
+                 *out_num_entries, certificate_ids.size());
+        R_RETURN(res);
     }
 
 private:
@@ -663,142 +803,188 @@ private:
 };
 
 class ISslServiceForSystem final : public ServiceFramework<ISslServiceForSystem> {
-    public:
-        explicit ISslServiceForSystem(Core::System& system_) : ServiceFramework{system_, "ssl:s"} {
-            // clang-format off
-            static const FunctionInfo functions[] = {
-                {0, D<&ISslServiceForSystem::CreateContext>, "CreateContext"},
-                {1, D<&ISslServiceForSystem::GetContextCount>, "GetContextCount"},
-                {2, D<&ISslServiceForSystem::GetCertificates>, "GetCertificates"},
-                {3, D<&ISslServiceForSystem::GetCertificateBufSize>, "GetCertificateBufSize"},
-                {4, D<&ISslServiceForSystem::DebugIoctl>, "DebugIoctl"},
-                {5, D<&ISslServiceForSystem::SetInterfaceVersion>, "SetInterfaceVersion"},
-                {6, D<&ISslServiceForSystem::FlushSessionCache>, "FlushSessionCache"},
-                {7, D<&ISslServiceForSystem::SetDebugOption>, "SetDebugOption"},
-                {8, D<&ISslServiceForSystem::GetDebugOption>, "GetDebugOption"},
-                {9, D<&ISslServiceForSystem::ClearTls12FallbackFlag>, "ClearTls12FallbackFlag"},
-                {100, D<&ISslServiceForSystem::CreateContextForSystem>, "CreateContextForSystem"},
-                {101, D<&ISslServiceForSystem::SetThreadCoreMask>, "SetThreadCoreMask"},
-                {102, D<&ISslServiceForSystem::GetThreadCoreMask>, "GetThreadCoreMask"},
-                {103, D<&ISslServiceForSystem::VerifySignature>, "VerifySignature"}
-            };
-            // clang-format on
-
-            RegisterHandlers(functions);
+public:
+    explicit ISslServiceForSystem(Core::System& system_)
+        : ServiceFramework{system_, "ssl:s"}, cert_store{system} {
+        // clang-format off
+        // [Nextendo] Shares command IDs with ISslService (0-9); system-only extensions start
+        // at 100. Titles that open their SSL context through ssl:s instead of plain ssl
+        // (Splatoon 3's gRPC/NintendoSDK_NPLN stack does) need real CreateContext and
+        // GetCertificates/GetCertificateBufSize (2/3) to validate the server's cert chain;
+        // stubs that return success without outputs leave their TLS setup unable to proceed.
+        // Mirrors ISslService's implementations (own cert_store, same behavior). Eden has no
+        // ISslContextForSystem, so CreateContextForSystem (100) also pushes a plain ISslContext.
+        static const FunctionInfo functions[] = {
+            {0, &ISslServiceForSystem::CreateContext, "CreateContext"},
+            {1, &ISslServiceForSystem::GetContextCount, "GetContextCount"},
+            {2, D<&ISslServiceForSystem::GetCertificates>, "GetCertificates"},
+            {3, D<&ISslServiceForSystem::GetCertificateBufSize>, "GetCertificateBufSize"},
+            {4, nullptr, "DebugIoctl"},
+            {5, &ISslServiceForSystem::SetInterfaceVersion, "SetInterfaceVersion"},
+            {6, &ISslServiceForSystem::FlushSessionCache, "FlushSessionCache"},
+            {7, &ISslServiceForSystem::SetDebugOption, "SetDebugOption"},
+            {8, &ISslServiceForSystem::GetDebugOption, "GetDebugOption"},
+            {9, &ISslServiceForSystem::ClearTls12FallbackFlag, "ClearTls12FallbackFlag"},
+            {100, &ISslServiceForSystem::CreateContextForSystem, "CreateContextForSystem"},
+            {101, &ISslServiceForSystem::SetThreadCoreMask, "SetThreadCoreMask"},
+            {102, &ISslServiceForSystem::GetThreadCoreMask, "GetThreadCoreMask"},
+            {103, &ISslServiceForSystem::VerifySignature, "VerifySignature"},
+            {104, nullptr, "SetCertificateAndPrivateKeyInternal"},
         };
+        // clang-format on
 
-        Result CreateContext() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
+        RegisterHandlers(functions);
+    }
 
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result GetContextCount() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result GetCertificates() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result GetCertificateBufSize() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result DebugIoctl() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result SetInterfaceVersion() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result FlushSessionCache() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result SetDebugOption() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result GetDebugOption() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result ClearTls12FallbackFlag() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result CreateContextForSystem() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result SetThreadCoreMask() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result GetThreadCoreMask() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
-
-        Result VerifySignature() {
-            LOG_DEBUG(Service_SSL, "(STUBBED) called.");
-
-            // TODO (jarrodnorwell)
-
-            return ResultSuccess;
-        };
+private:
+    struct CreateContextParameters {
+        SslVersion ssl_version;
+        INSERT_PADDING_BYTES(0x4);
+        u64 pid_placeholder;
     };
+    static_assert(sizeof(CreateContextParameters) == 0x10, "Parameters is an invalid size");
+
+    void CreateContext(HLERequestContext& ctx) {
+        IPC::RequestParser rp{ctx};
+        const auto parameters = rp.PopRaw<CreateContextParameters>();
+
+        LOG_WARNING(Service_SSL, "(STUBBED) called, api_version={}, pid_placeholder={}",
+                    parameters.ssl_version.api_version, parameters.pid_placeholder);
+
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface<ISslContext>(system, parameters.ssl_version);
+    }
+
+    void GetContextCount(HLERequestContext& ctx) {
+        LOG_WARNING(Service_SSL, "(STUBBED) called");
+
+        // Return stub count of 0 active contexts
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(0);
+    }
+
+    Result GetCertificateBufSize(
+        Out<u32> out_size, InArray<CaCertificateId, BufferAttr_HipcMapAlias> certificate_ids) {
+        LOG_INFO(Service_SSL, "called");
+        u32 num_entries;
+        Result res = cert_store.GetCertificateBufSize(out_size, &num_entries, certificate_ids);
+        LOG_INFO(Service_SSL, "[Nextendo][DIAG] GetCertificateBufSize -> size={} num_entries={} requested_ids={}",
+                 *out_size, num_entries, certificate_ids.size());
+        R_RETURN(res);
+    }
+
+    Result GetCertificates(Out<u32> out_num_entries, OutBuffer<BufferAttr_HipcMapAlias> out_buffer,
+                           InArray<CaCertificateId, BufferAttr_HipcMapAlias> certificate_ids) {
+        LOG_INFO(Service_SSL, "called");
+        Result res = cert_store.GetCertificates(out_num_entries, out_buffer, certificate_ids);
+        LOG_INFO(Service_SSL, "[Nextendo][DIAG] GetCertificates -> num_entries={} requested_ids={}",
+                 *out_num_entries, certificate_ids.size());
+        R_RETURN(res);
+    }
+
+    void SetInterfaceVersion(HLERequestContext& ctx) {
+        IPC::RequestParser rp{ctx};
+        const u32 ssl_version = rp.Pop<u32>();
+
+        LOG_DEBUG(Service_SSL, "called, ssl_version={}", ssl_version);
+
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void FlushSessionCache(HLERequestContext& ctx) {
+        LOG_WARNING(Service_SSL, "(STUBBED) called");
+
+        IPC::RequestParser rp{ctx};
+        const u32 option_type = rp.Pop<u32>();
+
+        // Read the hostname buffer if provided for option_type 0
+        if (option_type == 0 && ctx.CanReadBuffer(0)) {
+            const auto hostname = Common::StringFromBuffer(ctx.ReadBuffer(0));
+            LOG_INFO(Service_SSL, "FlushSessionCache with hostname={}", hostname);
+        }
+
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(0); // Flushed session count, stubbed to 0
+    }
+
+    void SetDebugOption(HLERequestContext& ctx) {
+        IPC::RequestParser rp{ctx};
+        const u32 debug_option_type = rp.Pop<u32>();
+
+        LOG_WARNING(Service_SSL, "(STUBBED) called, debug_option_type={}", debug_option_type);
+
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetDebugOption(HLERequestContext& ctx) {
+        IPC::RequestParser rp{ctx};
+        const u32 debug_option_type = rp.Pop<u32>();
+
+        LOG_WARNING(Service_SSL, "(STUBBED) called, debug_option_type={}", debug_option_type);
+
+        // Write stub debug option value to buffer
+        if (ctx.CanWriteBuffer()) {
+            std::array<u8, 1> debug_value{0};
+            ctx.WriteBuffer(debug_value);
+        }
+
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ClearTls12FallbackFlag(HLERequestContext& ctx) {
+        LOG_WARNING(Service_SSL, "(STUBBED) called");
+
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateContextForSystem(HLERequestContext& ctx) {
+        IPC::RequestParser rp{ctx};
+        const auto parameters = rp.PopRaw<CreateContextParameters>();
+
+        LOG_WARNING(Service_SSL, "(STUBBED) called, api_version={}, pid_placeholder={}",
+                    parameters.ssl_version.api_version, parameters.pid_placeholder);
+
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface<ISslContext>(system, parameters.ssl_version);
+    }
+
+    void SetThreadCoreMask(HLERequestContext& ctx) {
+        IPC::RequestParser rp{ctx};
+        const u64 core_mask = rp.Pop<u64>();
+
+        LOG_WARNING(Service_SSL, "(STUBBED) called, core_mask={:016X}", core_mask);
+
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetThreadCoreMask(HLERequestContext& ctx) {
+        LOG_WARNING(Service_SSL, "(STUBBED) called");
+
+        constexpr u64 core_mask = 0;
+
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(core_mask);
+    }
+
+    void VerifySignature(HLERequestContext& ctx) {
+        LOG_WARNING(Service_SSL, "(STUBBED) called");
+
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    CertStore cert_store;
+};
 
 void LoopProcess(Core::System& system) {
     auto server_manager = std::make_unique<ServerManager>(system);

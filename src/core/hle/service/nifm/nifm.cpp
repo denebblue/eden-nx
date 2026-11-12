@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -375,31 +376,63 @@ public:
         event1 = CreateKEvent(service_context, "IRequest:Event1");
         event2 = CreateKEvent(service_context, "IRequest:Event2");
         state = RequestState::NotSubmitted;
+
+        // [Nextendo] ResolveState() (and the event signal it can trigger via UpdateState) would
+        // otherwise only run as a side effect of the guest calling GetRequestState/GetResult/
+        // Submit again. A title that creates this request, grabs the event handles and just waits
+        // on them (Splatoon 3's NPLN-readiness worker spins a timeout=0 WaitSynchronization probe
+        // every ~16ms without re-invoking any IRequest method) would never be woken. Poll every
+        // 100ms for the lifetime of this request and signal whenever the state actually changes,
+        // like a real console's nifm does regardless of whether the application is querying it.
+        state_poll_event = Core::Timing::CreateEvent(
+            "IRequest::StatePoll",
+            [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                std::scoped_lock lk{state_lock};
+                ResolveState();
+                return std::nullopt;
+            });
+        system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds(100),
+                                                 std::chrono::milliseconds(100), state_poll_event);
     }
 
     ~IRequest() override {
+        system.CoreTiming().UnscheduleEvent(state_poll_event);
         service_context.CloseEvent(event1);
         service_context.CloseEvent(event2);
     }
 
 private:
-    void Submit(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_NIFM, "(STUBBED) called");
-
-        if (state == RequestState::NotSubmitted) {
-            UpdateState(RequestState::OnHold);
+    // [Nextendo] Resolves immediately; parking in OnHold made titles that poll GetRequestState
+    // hang. Callable from either the IPC-dispatch thread (guest calling GetRequestState/
+    // GetResult/Submit) or the CoreTiming thread (state_poll_event above); state_lock, held by
+    // every caller, keeps the read-modify-write of `state` and the event signal consistent.
+    RequestState ResolveState() {
+        const bool has_connection = Network::GetHostIPv4Address().has_value() &&
+                                    !Settings::values.airplane_mode.GetValue();
+        const auto new_state = has_connection ? RequestState::Accepted : RequestState::NotSubmitted;
+        if (state != new_state) {
+            UpdateState(new_state);
         }
+        return state;
+    }
+
+    void Submit(HLERequestContext& ctx) {
+        std::scoped_lock lk{state_lock};
+        LOG_DEBUG(Service_NIFM, "called, state={}", static_cast<u32>(ResolveState()));
 
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetRequestState(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_NIFM, "(STUBBED) called");
+        std::scoped_lock lk{state_lock};
+        const auto current = ResolveState();
+
+        LOG_DEBUG(Service_NIFM, "called, state={}", static_cast<u32>(current));
 
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.PushEnum(state);
+        rb.PushEnum(current);
     }
 
     void SetRequirementPreset(HLERequestContext& ctx) {
@@ -427,26 +460,12 @@ private:
     }
 
     void GetResult(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_NIFM, "(STUBBED) called");
+        std::scoped_lock lk{state_lock};
+        const auto current = ResolveState();
+        const auto result = current == RequestState::Accepted ? ResultSuccess
+                                                             : ResultNetworkCommunicationDisabled;
 
-        const auto result = [this] {
-            const auto has_connection = Network::GetHostIPv4Address().has_value() &&
-                                        !Settings::values.airplane_mode.GetValue();
-            switch (state) {
-            case RequestState::NotSubmitted:
-                return has_connection ? ResultSuccess : ResultNetworkCommunicationDisabled;
-            case RequestState::OnHold:
-                if (has_connection) {
-                    UpdateState(RequestState::Accepted);
-                } else {
-                    UpdateState(RequestState::Invalid);
-                }
-                return ResultPendingConnection;
-            case RequestState::Accepted:
-            default:
-                return ResultSuccess;
-            }
-        }();
+        LOG_DEBUG(Service_NIFM, "called, state={}", static_cast<u32>(current));
 
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(result);
@@ -489,14 +508,22 @@ private:
     }
 
     void UpdateState(RequestState new_state) {
-        LOG_DEBUG(Service_NIFM, "(STUBBED) called");
+        LOG_DEBUG(Service_NIFM, "called, new_state={}", static_cast<u32>(new_state));
         state = new_state;
         event1->Signal();
+        // [Nextendo] event2 (the second handle GetSystemEventReadableHandles hands the guest) was
+        // never signaled anywhere; a title that waits on it instead of/alongside event1 (Splatoon
+        // 3's NPLN-readiness worker) would wait forever. Signal both on every state change until
+        // the real, distinct semantics for event2 are known; a spurious extra wake on an
+        // already-satisfied wait is harmless.
+        event2->Signal();
     }
 
     KernelHelpers::ServiceContext service_context;
 
     RequestState state;
+    std::mutex state_lock;
+    std::shared_ptr<Core::Timing::EventType> state_poll_event;
 
     Kernel::KEvent* event1;
     Kernel::KEvent* event2;
@@ -520,7 +547,7 @@ public:
 
 void IGeneralService::GetClientId(HLERequestContext& ctx) {
     static constexpr u32 client_id = 1;
-    LOG_WARNING(Service_NIFM, "(STUBBED) called");
+    LOG_DEBUG(Service_NIFM, "called");
 
     IPC::ResponseBuilder rb{ctx, 4};
     rb.Push(ResultSuccess);
@@ -992,13 +1019,14 @@ void IGeneralService::IsAnyInternetRequestAccepted(HLERequestContext& ctx) {
 }
 
 void IGeneralService::IsAnyForegroundRequestAccepted(HLERequestContext& ctx) {
-    const bool is_accepted{};
+    const bool is_accepted = Network::GetHostIPv4Address().has_value() &&
+                             !Settings::values.airplane_mode.GetValue();
 
-    LOG_WARNING(Service_NIFM, "(STUBBED) called, is_accepted={}", is_accepted);
+    LOG_DEBUG(Service_NIFM, "called, is_accepted={}", is_accepted);
 
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
-    rb.Push<u8>(is_accepted);
+    rb.Push<u8>(static_cast<u8>(is_accepted));
 }
 
 void IGeneralService::GetSsidListVersion(HLERequestContext& ctx) {

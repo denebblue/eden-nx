@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
+#include <cstring>
+
 #include "common/settings.h"
 #include "common/uuid.h"
 #include "core/file_sys/control_metadata.h"
@@ -139,6 +142,41 @@ Result IApplicationFunctions::EnsureSaveData(Out<u64> out_size, Common::UUID use
     FileSys::VirtualDir save_data{};
     R_TRY(system.GetFileSystemController().OpenSaveDataController()->CreateSaveData(
         &save_data, FileSys::SaveDataSpaceId::User, attribute));
+
+    // [Nextendo] A real console also provisions the title's BCAT delivery-cache storage here,
+    // proactively, the first time EnsureSaveData runs -- not just the account save above. Ryujinx
+    // never did this at all (upstream bug, not Nextendo-specific) until it hit Splatoon 3, which
+    // requests its BCAT cache at startup and got refused with PermissionDenied against
+    // never-provisioned storage; the game retried every ~500ms, forever, and never advanced past
+    // that point. Splatoon 2 uses BCAT's legacy command path and never touches this, which is why
+    // this went unnoticed for years. Matches Ryujinx-Nextendo's own fix (df268d0/e7d39fa,
+    // ProcessLoaderHelper's EnsureApplicationBcatDeliveryCacheStorage): gate on the NACP's own
+    // declared BcatDeliveryCacheStorageSize, so titles that don't use BCAT are unaffected.
+    const FileSys::PatchManager pm{m_applet->program_id, system.GetFileSystemController(),
+                                   system.GetContentProvider()};
+    const auto metadata = pm.GetControlMetadata();
+    u64 bcat_delivery_cache_storage_size{};
+    if (metadata.first != nullptr) {
+        // Eden's NACP has no accessor for this field; read it from the raw structure.
+        const auto raw_nacp = metadata.first->GetRawBytes();
+        constexpr auto offset = offsetof(FileSys::RawNACP, bcat_delivery_cache_storage_size);
+        if (raw_nacp.size() >= offset + sizeof(u64)) {
+            std::memcpy(&bcat_delivery_cache_storage_size, raw_nacp.data() + offset, sizeof(u64));
+        }
+    }
+    if (bcat_delivery_cache_storage_size > 0) {
+        FileSys::SaveDataAttribute bcat_attribute{};
+        bcat_attribute.program_id = m_applet->program_id;
+        bcat_attribute.type = FileSys::SaveDataType::Bcat;
+
+        FileSys::VirtualDir bcat_save_data{};
+        const auto bcat_result = system.GetFileSystemController().OpenSaveDataController()->CreateSaveData(
+            &bcat_save_data, FileSys::SaveDataSpaceId::User, bcat_attribute);
+        if (bcat_result.IsError()) {
+            LOG_WARNING(Service_AM, "Failed to provision BCAT delivery-cache storage: {}",
+                       bcat_result.raw);
+        }
+    }
 
     *out_size = 0;
     R_SUCCEED();
@@ -481,17 +519,14 @@ Result IApplicationFunctions::TryPopFromFriendInvitationStorageChannel(
     LOG_DEBUG(Service_AM, "called");
 
     std::scoped_lock lk{m_applet->lock};
-
     auto& channel = m_applet->friend_invitation_storage_channel;
-
+    R_UNLESS(!channel.empty(), AM::ResultNoDataInChannel);
+    // FIFO: invitations are delivered in the order they were accepted.
+    *out_storage = std::make_shared<IStorage>(system, std::move(channel.front()));
+    channel.pop_front();
     if (channel.empty()) {
-        return AM::ResultNoDataInChannel;
+        m_applet->friend_invitation_storage_channel_event.Clear();
     }
-
-    auto data = channel.back();
-    channel.pop_back();
-
-    *out_storage = std::make_shared<IStorage>(system, std::move(data));
     R_SUCCEED();
 }
 

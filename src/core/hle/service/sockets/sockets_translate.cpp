@@ -23,6 +23,8 @@ Errno Translate(Network::Errno value) {
         return Errno::BADF;
     case Network::Errno::AGAIN:
         return Errno::AGAIN;
+    case Network::Errno::ADDRINUSE:
+        return Errno::ADDRINUSE;
     case Network::Errno::INVAL:
         return Errno::INVAL;
     case Network::Errno::MFILE:
@@ -43,6 +45,8 @@ Errno Translate(Network::Errno value) {
         return Errno::INPROGRESS;
     case Network::Errno::ISCONN:
         return Errno::ISCONN;
+    case Network::Errno::ALREADY:
+        return Errno::ALREADY;
     default:
         UNIMPLEMENTED_MSG("Unimplemented errno={}", value);
         return Errno::SUCCESS;

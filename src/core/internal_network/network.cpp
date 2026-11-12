@@ -5,24 +5,30 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "common/error.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #else
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -42,6 +48,7 @@ namespace {
 
 enum class CallType {
     Send,
+    Connect,
     Other,
 };
 
@@ -125,6 +132,8 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
         return Errno::SUCCESS;
     case WSAEBADF:
         return Errno::BADF;
+    case WSAEADDRINUSE:
+        return Errno::ADDRINUSE;
     case WSAEINVAL:
         return Errno::INVAL;
     case WSAEMFILE:
@@ -132,7 +141,17 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
     case WSAENOTCONN:
         return Errno::NOTCONN;
     case WSAEWOULDBLOCK:
-        return Errno::AGAIN;
+        // [Nextendo] Windows overloads WSAEWOULDBLOCK for a non-blocking connect() that's
+        // actually in progress -- POSIX has a distinct EINPROGRESS for that specific case, and
+        // everywhere that's not a connect() call, WSAEWOULDBLOCK really does just mean "would
+        // block, try again" (EAGAIN). Returning EAGAIN here for connect() told the guest its
+        // connection attempt just plain failed, when the real answer (matching what Unix's
+        // errno already unambiguously reports) was "still connecting, come back to it" --
+        // confirmed directly: a real connect() to a live server was rejected outright at the
+        // very first EAGAIN instead of proceeding through completion via poll(), and the game's
+        // own retry loop kept starting the whole sequence over from scratch forever, unable to
+        // ever get far enough to actually finish connecting.
+        return call_type == CallType::Connect ? Errno::INPROGRESS : Errno::AGAIN;
     case WSAECONNREFUSED:
         return Errno::CONNREFUSED;
     case WSAECONNABORTED:
@@ -157,7 +176,12 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
         return Errno::TIMEDOUT;
     case WSAEINPROGRESS:
         return Errno::INPROGRESS;
+    case WSAEALREADY:
+        return Errno::ALREADY;
     case WSAEISCONN:
+        // [Nextendo] Games that poll a non-blocking connect() by calling connect() again (e.g.
+        // Playtest Program's game-server link) wait for EISCONN. Unmapped, this became EINVAL
+        // and the guest never saw the connection complete, so it never sent its TLS ClientHello.
         return Errno::ISCONN;
     default:
         UNIMPLEMENTED_MSG("Unimplemented errno={}", e);
@@ -270,6 +294,8 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
         return Errno::SUCCESS;
     case EBADF:
         return Errno::BADF;
+    case EADDRINUSE:
+        return Errno::ADDRINUSE;
     case EINVAL:
         return Errno::INVAL;
     case EMFILE:
@@ -298,6 +324,8 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
         return Errno::TIMEDOUT;
     case EINPROGRESS:
         return Errno::INPROGRESS;
+    case EALREADY:
+        return Errno::ALREADY;
     case EISCONN:
         return Errno::ISCONN;
     default:
@@ -315,7 +343,8 @@ Errno GetAndLogLastError(CallType call_type = CallType::Other) {
     int e = errno;
 #endif
     const Errno err = TranslateNativeError(e, call_type);
-    if (err == Errno::AGAIN || err == Errno::TIMEDOUT || err == Errno::INPROGRESS) {
+    if (err == Errno::AGAIN || err == Errno::TIMEDOUT || err == Errno::INPROGRESS ||
+        err == Errno::ALREADY || err == Errno::ISCONN) {
         // These happen during normal operation, so only log them at debug level.
         LOG_DEBUG(Network, "Socket operation error: {}", Common::NativeErrorToString(e));
         return err;
@@ -688,6 +717,69 @@ PollEvents TranslatePollRevents(short revents) {
     return result;
 }
 
+// [Nextendo] WSAPoll never reports POLLHUP/POLLERR for a peer that closed or reset an
+// already-established TCP connection -- per MSDN, the exceptfds-derived bits it sets only
+// cover OOB data and a failed connect(), never a FIN/RST on a live socket. A socket whose peer
+// hung up therefore polls as revents=0 forever: to the guest that reads as "nothing ready yet"
+// indefinitely instead of "this connection is dead", starving whatever retry/give-up logic
+// depends on ever actually seeing an error. Ryujinx-Nextendo hit and fixed this same Windows
+// gap (see ManagedSocketPollManager.cs's IsPeerHungUp -- measured 142 consecutive empty polls,
+// 38.8s, stuck on a gRPC socket before that fix landed). Observe queued bytes and TCP state
+// instead of trusting WSAPoll's revents alone. Never read here: the guest may have left the
+// descriptor in blocking mode, and another reader can consume data between readiness and peek.
+//
+// WIN32-only: this whole gap is specific to WSAPoll's exceptfds behavior. Real POSIX poll()
+// on Linux/macOS already reports POLLHUP/POLLERR correctly for a hung-up peer, and this
+// function's SOCKET/SOCKET_ERROR/WSAGetLastError/WSAE* symbols are Winsock-only -- they don't
+// exist on those platforms, so building this unconditionally broke non-Windows CI.
+#ifdef _WIN32
+bool PeekPeerHungUp(SOCKET native_fd, bool& has_pending_data) {
+    has_pending_data = false;
+
+    int sock_type = 0;
+    int sock_type_len = sizeof(sock_type);
+    if (getsockopt(native_fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sock_type),
+                   &sock_type_len) == SOCKET_ERROR ||
+        sock_type != SOCK_STREAM) {
+        // Only a connected stream socket has a meaningful "hung up" concept; a listening or
+        // UDP socket reading back "nothing ready" is unrelated and shouldn't be peeked.
+        return false;
+    }
+
+    // recv(MSG_PEEK) blocks on a blocking descriptor. A guest's Poll can
+    // therefore strand the socket worker and CloseServices() indefinitely.
+    // FIONREAD observes queued data without consuming it or changing I/O mode.
+    u_long available = 0;
+    if (ioctlsocket(native_fd, FIONREAD, &available) == SOCKET_ERROR) {
+        const int error = WSAGetLastError();
+        return error == WSAECONNRESET || error == WSAECONNABORTED ||
+               error == WSAENETRESET || error == WSAESHUTDOWN;
+    }
+    if (available > 0) {
+        has_pending_data = true;
+        return false;
+    }
+    // SIO_TCP_INFO version 0 starts with a 32-bit TCPSTATE. Use a bounded
+    // output buffer so SDKs targeting pre-RS2 still compile; an older provider
+    // can reject this optional observation without falling back to recv().
+    // https://learn.microsoft.com/windows/win32/winsock/sio-tcp-info
+    constexpr DWORD tcp_info_control = _WSAIORW(IOC_VENDOR, 39);
+    DWORD version = 0;
+    DWORD returned = 0;
+    std::array<unsigned char, 256> info{};
+    if (WSAIoctl(native_fd, tcp_info_control, &version, sizeof(version), info.data(),
+                 static_cast<DWORD>(info.size()), &returned, nullptr, nullptr) == SOCKET_ERROR ||
+        returned < sizeof(DWORD)) {
+        return false;
+    }
+    DWORD state = 0;
+    std::memcpy(&state, info.data(), sizeof(state));
+    // TCPSTATE_CLOSED, CLOSE_WAIT, CLOSING, LAST_ACK and TIME_WAIT respectively.
+    // ESTABLISHED/SYN/LISTEN and unknown future states are not peer shutdowns.
+    return state == 0 || state == 7 || state == 8 || state == 9 || state == 10;
+}
+#endif
+
 } // Anonymous namespace
 
 NetworkInstance::NetworkInstance() {
@@ -726,6 +818,26 @@ std::string IPv4AddressToString(IPv4Address ip_addr) {
     std::array<char, INET_ADDRSTRLEN> buf = {};
     ASSERT(inet_ntop(AF_INET, &ip_addr, buf.data(), sizeof(buf)) == buf.data());
     return std::string(buf.data());
+}
+
+std::string IPv4AddressToRedactedString(IPv4Address ip_addr) {
+    return fmt::format("{}.{}.x.x", ip_addr[0], ip_addr[1]);
+}
+
+// [Nextendo] A game can receive a peer's address as a literal IP string (e.g. baked into a
+// matchmaking ticket) and hand it straight to getaddrinfo -- there is nothing to actually
+// resolve. Falling through to a real lookup on an already-numeric host is exactly the bug
+// Ryujinx-Nextendo's own DnsMitmResolver fix (2026-08-13) diagnosed for Splatoon 3's gRPC/NPLN
+// connections: of the endpoints the game opens, only the one resolved by its real hostname
+// worked -- the others completed TCP+TLS+HTTP/2 but never sent a HEADERS frame and closed
+// after ~1s, because whatever canonical name a fallback lookup produced for an already-literal
+// IP was some unrelated host (every redirected hostname shares the same IP, so any lookup that
+// isn't a no-op returns whichever name happens to reverse-resolve for it), and the game builds
+// its HTTP/2 :authority header from that corrupted name. Matches Ryujinx-Nextendo's own fix:
+// return the literal address as-is, with itself as both address and hostname, and do it BEFORE
+// any redirect/blocklist logic -- a literal IP was never a hostname to redirect or block.
+bool TryParseIPv4Literal(const std::string& host, IPv4Address& out) {
+    return inet_pton(AF_INET, host.c_str(), out.data()) == 1;
 }
 
 u32 IPv4AddressToInteger(IPv4Address ip_addr) {
@@ -784,23 +896,34 @@ std::pair<s32, Errno> Poll(std::vector<PollFD>& pollfds, s32 timeout) {
 
     const int result =
         WSAPoll(host_pollfds.data(), static_cast<ULONG>(host_pollfds.size()), timeout);
-    if (result == 0) {
-        ASSERT(std::all_of(host_pollfds.begin(), host_pollfds.end(),
-                           [](WSAPOLLFD fd) { return fd.revents == 0; }));
-        return {0, Errno::SUCCESS};
+    if (result == SOCKET_ERROR) {
+        return {-1, GetAndLogLastError()};
     }
 
+    // [Nextendo] See PeekPeerHungUp's comment (WIN32-only -- WSAPoll's exceptfds gap doesn't
+    // exist on POSIX poll()). Re-check every fd the caller asked to read from that WSAPoll
+    // didn't already report ready -- regardless of whether WSAPoll returned 0 or reported some
+    // other fd ready -- so a peer that hung up gets surfaced as ready-with-Hup instead of
+    // silently polling as not-ready forever.
+    s32 real_count = 0;
     for (size_t i = 0; i < num; ++i) {
         pollfds[i].revents = TranslatePollRevents(host_pollfds[i].revents);
+#ifdef _WIN32
+        if (True(pollfds[i].events & PollEvents::In) &&
+            False(pollfds[i].revents & (PollEvents::In | PollEvents::Err | PollEvents::Hup))) {
+            bool has_pending_data = false;
+            if (PeekPeerHungUp(host_pollfds[i].fd, has_pending_data)) {
+                pollfds[i].revents |= PollEvents::In | PollEvents::Hup;
+            } else if (has_pending_data) {
+                pollfds[i].revents |= PollEvents::In;
+            }
+        }
+#endif
+        if (pollfds[i].revents != PollEvents{}) {
+            ++real_count;
+        }
     }
-
-    if (result > 0) {
-        return {result, Errno::SUCCESS};
-    }
-
-    ASSERT(result == SOCKET_ERROR);
-
-    return {-1, GetAndLogLastError()};
+    return {real_count, Errno::SUCCESS};
 }
 
 Socket::~Socket() {
@@ -837,13 +960,49 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int option, T value) {
     return GetAndLogLastError();
 }
 
+namespace {
+void EnableAggressiveTcpKeepAlive(SOCKET fd) {
+    constexpr u32 enable = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&enable),
+               sizeof(enable));
+
+#ifdef _WIN32
+    tcp_keepalive vals{1, 5000, 5000};
+    DWORD bytes_returned = 0;
+    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals), nullptr, 0, &bytes_returned, nullptr,
+             nullptr);
+#else
+    [[maybe_unused]] constexpr u32 idle = 5;
+    [[maybe_unused]] constexpr u32 interval = 5;
+    [[maybe_unused]] constexpr u32 count = 3;
+#if defined(__APPLE__) && defined(TCP_KEEPALIVE)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+#elif defined(TCP_KEEPIDLE)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+#endif
+}
+} // Anonymous namespace
+
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
-    if (fd != INVALID_SOCKET) {
-        return Errno::SUCCESS;
+    if (fd == INVALID_SOCKET) {
+        return GetAndLogLastError();
     }
 
-    return GetAndLogLastError();
+    // [Nextendo] Stay ahead of NAT/firewall idle-connection drops regardless of whether the
+    // game asked.
+    if (type == Type::STREAM) {
+        EnableAggressiveTcpKeepAlive(fd);
+    }
+
+    return Errno::SUCCESS;
 }
 
 std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
@@ -890,7 +1049,46 @@ Errno Socket::Connect(SockAddrIn addr_in) {
         return Errno::SUCCESS;
     }
 
-    return GetAndLogLastError();
+    const Errno result = GetAndLogLastError(CallType::Connect);
+    if (result != Errno::INPROGRESS) {
+        return result;
+    }
+
+    // [Nextendo] Splatoon 3's gRPC connection stack doesn't survive Citron's honest
+    // non-blocking connect()+EINPROGRESS+poll() cycle reliably -- something in its own
+    // retry bookkeeping gives up long before the connection actually finishes, even
+    // though the TCP handshake itself always succeeds. Ryujinx-Nextendo sidesteps this
+    // entire class of timing issue by never handing the guest an "in progress" status
+    // for this connect() at all: it blocks host-side until the handshake genuinely
+    // completes and reports the definitive outcome directly (see Ryujinx's own log
+    // line "grpc connect completed synchronously (blocked for host completion)").
+    // Mirror that here with a bounded host-side wait instead of returning INPROGRESS.
+    WSAPOLLFD wait_fd{};
+    wait_fd.fd = fd;
+    wait_fd.events = POLLOUT;
+    wait_fd.revents = 0;
+    constexpr int connect_wait_timeout_ms = 5000;
+    const int poll_result = WSAPoll(&wait_fd, 1, connect_wait_timeout_ms);
+    if (poll_result <= 0) {
+        // Timed out (or the wait itself errored) -- fall back to the original
+        // INPROGRESS status so the guest's own poll loop can still take over.
+        return result;
+    }
+
+    const auto [pending_err, getsockopt_err] = GetPendingError();
+    if (getsockopt_err != Errno::SUCCESS) {
+        return result;
+    }
+    if (pending_err != Errno::SUCCESS) {
+        LOG_ERROR(Network,
+                  "[Nextendo] Connect blocked-wait finished with error, errno={}",
+                  static_cast<int>(pending_err));
+        return pending_err;
+    }
+
+    LOG_INFO(Network, "[Nextendo] grpc connect completed synchronously (blocked for host "
+                      "completion) -> SUCCESS");
+    return Errno::SUCCESS;
 }
 
 std::pair<SockAddrIn, Errno> Socket::GetPeerName() {
@@ -946,7 +1144,21 @@ Errno Socket::Shutdown(ShutdownHow how) {
         UNIMPLEMENTED_MSG("Unimplemented flag how={}", how);
         return Errno::SUCCESS;
     }
-    if (shutdown(fd, host_how) != SOCKET_ERROR) {
+    const int shutdown_result = shutdown(fd, host_how);
+#ifdef _WIN32
+    // POSIX wakes a thread that is blocked in recv()/recvfrom() on this socket when shutdown(SHUT_RD or SHUT_RDWR) is called on it.
+    // Winsock does not do that for datagram sockets: the blocked call simply stays blocked. A guest that stops a receiver thread
+    // with shutdown() and then joins it waits forever (Just Dance 2022's local UDP listener). Cancelling the pending I/O gives
+    // the POSIX behaviour; Recv() and RecvFrom() report the cancellation as end of input.
+    const int shutdown_error = shutdown_result != SOCKET_ERROR ? 0 : WSAGetLastError();
+    if (host_how != SD_SEND) {
+        CancelIoEx(reinterpret_cast<HANDLE>(fd), nullptr);
+    }
+    if (shutdown_result == SOCKET_ERROR) {
+        WSASetLastError(shutdown_error);
+    }
+#endif
+    if (shutdown_result != SOCKET_ERROR) {
         return Errno::SUCCESS;
     }
 
@@ -963,6 +1175,12 @@ std::pair<s32, Errno> Socket::Recv(int flags, std::span<u8> message) {
         return {static_cast<s32>(result), Errno::SUCCESS};
     }
 
+#ifdef _WIN32
+    if (WSAGetLastError() == WSAEINTR) {
+        // Woken by Shutdown() on this socket (see there): POSIX reports end of input.
+        return {0, Errno::SUCCESS};
+    }
+#endif
     return {-1, GetAndLogLastError()};
 }
 
@@ -984,6 +1202,12 @@ std::pair<s32, Errno> Socket::RecvFrom(int flags, std::span<u8> message, SockAdd
         return {static_cast<s32>(result), Errno::SUCCESS};
     }
 
+#ifdef _WIN32
+    if (WSAGetLastError() == WSAEINTR) {
+        // Woken by Shutdown() on this socket (see there): POSIX reports end of input.
+        return {0, Errno::SUCCESS};
+    }
+#endif
     return {-1, GetAndLogLastError()};
 }
 
@@ -1045,6 +1269,14 @@ Errno Socket::SetLinger(bool enable, u32 linger) {
     return SetSockOpt(fd, SO_LINGER, MakeLinger(enable, linger));
 }
 
+std::tuple<bool, u32, Errno> Socket::GetLinger() {
+    auto [value, err] = GetSockOpt<decltype(MakeLinger(false, 0))>(fd, SO_LINGER);
+    if (err != Errno::SUCCESS) {
+        return {false, 0, err};
+    }
+    return {value.l_onoff != 0, static_cast<u32>(value.l_linger), Errno::SUCCESS};
+}
+
 Errno Socket::SetReuseAddr(bool enable) {
     return SetSockOpt<u32>(fd, SO_REUSEADDR, enable ? 1 : 0);
 }
@@ -1057,6 +1289,22 @@ Errno Socket::SetBroadcast(bool enable) {
     return SetSockOpt<u32>(fd, SO_BROADCAST, enable ? 1 : 0);
 }
 
+// [Nextendo] See the declaration comment in sockets.h.
+std::pair<bool, Errno> Socket::GetReuseAddr() {
+    auto [value, err] = GetSockOpt<u32>(fd, SO_REUSEADDR);
+    return {value != 0, err};
+}
+
+std::pair<bool, Errno> Socket::GetKeepAlive() {
+    auto [value, err] = GetSockOpt<u32>(fd, SO_KEEPALIVE);
+    return {value != 0, err};
+}
+
+std::pair<bool, Errno> Socket::GetBroadcast() {
+    auto [value, err] = GetSockOpt<u32>(fd, SO_BROADCAST);
+    return {value != 0, err};
+}
+
 Errno Socket::SetSndBuf(u32 value) {
     return SetSockOpt(fd, SO_SNDBUF, value);
 }
@@ -1065,6 +1313,22 @@ Errno Socket::SetRcvBuf(u32 value) {
     return SetSockOpt(fd, SO_RCVBUF, value);
 }
 
+std::pair<u32, Errno> Socket::GetSndBuf() {
+    return GetSockOpt<u32>(fd, SO_SNDBUF);
+}
+
+std::pair<u32, Errno> Socket::GetRcvBuf() {
+    return GetSockOpt<u32>(fd, SO_RCVBUF);
+}
+
+// [Nextendo] SO_SNDTIMEO/SO_RCVTIMEO take a raw DWORD (milliseconds) on Winsock, but POSIX
+// requires a struct timeval{tv_sec, tv_usec} instead -- passing the generic SetSockOpt<u32>'s
+// 4-byte int there fails setsockopt with EINVAL (confirmed live: a parked UDP socket's drain
+// thread call site never checked this Errno, so on Linux the timeout silently never applied and
+// its background RecvFrom blocked forever, hanging StopDrain()'s join() the first time a parked
+// socket needed to be reclaimed or expired -- P2P titles wedge shortly after their first NAT
+// hole-punch).
+#ifdef _WIN32
 Errno Socket::SetSndTimeo(u32 value) {
     return SetSockOpt(fd, SO_SNDTIMEO, value);
 }
@@ -1072,6 +1336,28 @@ Errno Socket::SetSndTimeo(u32 value) {
 Errno Socket::SetRcvTimeo(u32 value) {
     return SetSockOpt(fd, SO_RCVTIMEO, value);
 }
+#else
+namespace {
+Errno SetTimevalSockOpt(SOCKET fd_so, int option, u32 milliseconds) {
+    struct timeval tv {};
+    tv.tv_sec = static_cast<time_t>(milliseconds / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((milliseconds % 1000) * 1000);
+    const int result = setsockopt(fd_so, SOL_SOCKET, option, &tv, sizeof(tv));
+    if (result != SOCKET_ERROR) {
+        return Errno::SUCCESS;
+    }
+    return GetAndLogLastError();
+}
+} // namespace
+
+Errno Socket::SetSndTimeo(u32 value) {
+    return SetTimevalSockOpt(fd, SO_SNDTIMEO, value);
+}
+
+Errno Socket::SetRcvTimeo(u32 value) {
+    return SetTimevalSockOpt(fd, SO_RCVTIMEO, value);
+}
+#endif
 
 Errno Socket::SetNonBlock(bool enable) {
     if (EnableNonBlock(fd, enable)) {
@@ -1079,6 +1365,46 @@ Errno Socket::SetNonBlock(bool enable) {
         return Errno::SUCCESS;
     }
     return GetAndLogLastError();
+}
+
+// [Nextendo] IPPROTO_TCP-level, so these can't go through the generic SetSockOpt/GetSockOpt
+// helpers above (they hardcode SOL_SOCKET). See the declaration comment in sockets.h.
+Errno Socket::SetNoDelay(bool enable) {
+    const int value = enable ? 1 : 0;
+    const int result = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&value),
+                                   sizeof(value));
+    if (result != SOCKET_ERROR) {
+        no_delay_cache = enable;
+        return Errno::SUCCESS;
+    }
+    return GetAndLogLastError();
+}
+
+// [Nextendo] getsockopt(IPPROTO_TCP, TCP_NODELAY) on a socket that hasn't finished connect()
+// yet can come back with a short/zero-length value on Windows (confirmed live: the length
+// check below fails on every connect cycle for this exact call). Since `value` is
+// zero-initialized, a short write there silently reports nodelay=false even right after the
+// guest set it true. Prefer the last value the guest itself set -- SetNoDelay already proved
+// it took by checking setsockopt's own return -- over a getsockopt call whose length we can't
+// trust; only fall back to the raw read if the guest never called SetNoDelay on this socket.
+std::pair<bool, Errno> Socket::GetNoDelay() {
+    int value = 0;
+    socklen_t len = sizeof(value);
+    const int result =
+        getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&value), &len);
+    if (result != SOCKET_ERROR) {
+        if (len != sizeof(value)) {
+            if (no_delay_cache) {
+                return {*no_delay_cache, Errno::SUCCESS};
+            }
+            LOG_WARNING(Network, "getsockopt(TCP_NODELAY) returned len={} (expected {}), and no "
+                                  "prior SetNoDelay to fall back on -- reporting false",
+                        len, sizeof(value));
+            return {false, Errno::SUCCESS};
+        }
+        return {value != 0, Errno::SUCCESS};
+    }
+    return {false, GetAndLogLastError()};
 }
 
 bool Socket::IsOpened() const {

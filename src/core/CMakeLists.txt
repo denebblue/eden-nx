@@ -399,6 +399,10 @@ add_library(core STATIC
     hle/service/acc/async_context.cpp
     hle/service/acc/async_context.h
     hle/service/acc/errors.h
+    hle/service/acc/nextendo_account_country.cpp
+    hle/service/acc/nextendo_account_country.h
+    hle/service/acc/nextendo_baas_nsa.cpp
+    hle/service/acc/nextendo_baas_nsa.h
     hle/service/acc/profile_manager.cpp
     hle/service/acc/profile_manager.h
     hle/service/am/am.cpp
@@ -431,6 +435,9 @@ add_library(core STATIC
     hle/service/am/frontend/applet_net_connect.cpp
     hle/service/am/frontend/applet_net_connect.h
     hle/service/am/frontend/applet_profile_select.cpp
+    hle/service/am/frontend/applet_my_page.cpp
+    hle/service/am/frontend/applet_my_page.h
+    frontend/applets/friend_invitation.h
     hle/service/am/frontend/applet_profile_select.h
     hle/service/am/frontend/applet_software_keyboard.cpp
     hle/service/am/frontend/applet_software_keyboard.h
@@ -919,6 +926,12 @@ add_library(core STATIC
     hle/service/olsc/daemon_controller.h
     hle/service/olsc/native_handle_holder.cpp
     hle/service/olsc/native_handle_holder.h
+    hle/service/olsc/nextendo_island.cpp
+    hle/service/olsc/nextendo_island.h
+    hle/service/olsc/nextendo_island_cloud.cpp
+    hle/service/olsc/olsc_async_result.cpp
+    hle/service/olsc/olsc_async_result.h
+    hle/service/olsc/olsc_results.h
     hle/service/olsc/olsc_service_for_application.cpp
     hle/service/olsc/olsc_service_for_application.h
     hle/service/olsc/olsc_service_for_system_service.cpp
@@ -1071,6 +1084,8 @@ add_library(core STATIC
     hle/service/sockets/nsd.h
     hle/service/sockets/sfdnsres.cpp
     hle/service/sockets/sfdnsres.h
+    hle/service/sockets/nextendo_uch.cpp
+    hle/service/sockets/nextendo_uch.h
     hle/service/sockets/sockets.cpp
     hle/service/sockets/sockets.h
     hle/service/sockets/sockets_translate.cpp
@@ -1085,9 +1100,13 @@ add_library(core STATIC
     hle/service/spl/spl_types.h
     hle/service/ssl/cert_store.cpp
     hle/service/ssl/cert_store.h
+    hle/service/ssl/nextendo_nat_rewrite.cpp
+    hle/service/ssl/nextendo_nat_rewrite.h
     hle/service/ssl/ssl.cpp
     hle/service/ssl/ssl.h
     hle/service/ssl/ssl_backend.h
+    hle/service/ssl/ssl_pending_registry.cpp
+    hle/service/ssl/ssl_pending_registry.h
     hle/service/ssl/ssl_types.h
     hle/service/usb/usb.cpp
     hle/service/usb/usb.h
@@ -1143,6 +1162,19 @@ add_library(core STATIC
     loader/nax.h
     loader/nca.cpp
     loader/nca.h
+    loader/nextendo_amongus_patch.cpp
+    loader/nextendo_amongus_patch.h
+    loader/nextendo_dungeons2_patch.cpp
+    loader/nextendo_dungeons2_patch.h
+    loader/nextendo_necrodancer_patch.cpp
+    loader/nextendo_necrodancer_patch.h
+    loader/nextendo_pvzbfn_patch.cpp
+    loader/nextendo_pvzbfn_patch.h
+    loader/nextendo_s3_patches.cpp
+    loader/nextendo_s3_patches.h
+    loader/nextendo_jd22_patch.h
+    hle/kernel/svc/nextendo_deadline_watch.cpp
+    hle/kernel/svc/nextendo_deadline_watch.h
     loader/nro.cpp
     loader/nro.h
     loader/nso.cpp

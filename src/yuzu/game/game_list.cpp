@@ -30,6 +30,7 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
+#include "yuzu/nextendo/nextendo_bcat_titles.h"
 #include "yuzu/compatibility_list.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/game/game_list_p.h"
@@ -727,6 +728,10 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QAction* open_transferable_shader_cache =
         context_menu.addAction(tr("Open Transferable Pipeline Cache"));
     QAction* ryujinx = context_menu.addAction(tr("Link to Ryujinx"));
+    QAction* download_online_schedule = nullptr;
+    if (Nextendo::BcatTitles::IsBcatTitle(program_id)) {
+        download_online_schedule = context_menu.addAction(tr("Download Nextendo Online Data"));
+    }
     context_menu.addSeparator();
     QMenu* remove_menu = context_menu.addMenu(tr("Remove"));
     QAction* remove_update = remove_menu->addAction(tr("Remove Installed Update"));
@@ -848,6 +853,10 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
 
     connect(ryujinx, &QAction::triggered, this,
             [this, program_id]() { emit LinkToRyujinxRequested(program_id); });
+    if (download_online_schedule) {
+        connect(download_online_schedule, &QAction::triggered, this,
+                [this, program_id]() { emit DownloadNextendoScheduleRequested(program_id); });
+    }
 };
 
 void GameList::AddCustomDirPopup(QMenu& context_menu, QModelIndex selected) {

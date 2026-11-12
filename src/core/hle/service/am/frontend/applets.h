@@ -10,6 +10,7 @@
 #include <queue>
 
 #include "common/swap.h"
+#include "core/frontend/applets/friend_invitation.h"
 #include "core/hle/service/am/applet.h"
 #include "core/frontend/applets/net_connect.h"
 
@@ -30,6 +31,7 @@ class PhotoViewerApplet;
 class ProfileSelectApplet;
 class SoftwareKeyboardApplet;
 class WebBrowserApplet;
+class FriendInvitationApplet;
 } // namespace Core::Frontend
 
 namespace Kernel {
@@ -95,13 +97,15 @@ struct FrontendAppletSet {
     using SoftwareKeyboard = std::unique_ptr<Core::Frontend::SoftwareKeyboardApplet>;
     using WebBrowser = std::unique_ptr<Core::Frontend::WebBrowserApplet>;
     using NetConnect = std::unique_ptr<Core::Frontend::NetConnectApplet>;
+    using FriendInvitation = std::unique_ptr<Core::Frontend::FriendInvitationApplet>;
 
     FrontendAppletSet();
     FrontendAppletSet(CabinetApplet cabinet_applet, ControllerApplet controller_applet,
                       ErrorApplet error_applet, MiiEdit mii_edit_,
                       ParentalControlsApplet parental_controls_applet, PhotoViewer photo_viewer_,
                       ProfileSelect profile_select_, SoftwareKeyboard software_keyboard_,
-                      WebBrowser web_browser_, NetConnect net_connect_);
+                      WebBrowser web_browser_, NetConnect net_connect_,
+                      FriendInvitation friend_invitation_ = nullptr);
     ~FrontendAppletSet();
 
     FrontendAppletSet(const FrontendAppletSet&) = delete;
@@ -120,6 +124,7 @@ struct FrontendAppletSet {
     SoftwareKeyboard software_keyboard;
     WebBrowser web_browser;
     NetConnect net_connect;
+    FriendInvitation friend_invitation;
 };
 
 class FrontendAppletHolder {

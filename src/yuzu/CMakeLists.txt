@@ -27,6 +27,8 @@ add_executable(yuzu
     applets/qt_controller.ui
     applets/qt_error.cpp
     applets/qt_error.h
+    applets/qt_friend_invitation.cpp
+    applets/qt_friend_invitation.h
     applets/qt_profile_select.cpp
     applets/qt_profile_select.h
     applets/qt_software_keyboard.cpp
@@ -247,6 +249,23 @@ add_executable(yuzu
     libqt_common.h libqt_common.cpp
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
 
+    nextendo/nextendo_account_dialog.cpp
+    nextendo/nextendo_account_dialog.h
+    nextendo/nextendo_bcat_titles.h
+    nextendo/nextendo_controller.cpp
+    nextendo/nextendo_controller.h
+    nextendo/nextendo_game_invites.cpp
+    nextendo/nextendo_game_invites.h
+    nextendo/nextendo_main_window.cpp
+    nextendo/nextendo_package_bcat.h
+    nextendo/nextendo_save_sync.cpp
+    nextendo/nextendo_save_sync.h
+    nextendo/nextendo_splatoon3_bcat.h
+    nextendo/nextendo_toast.cpp
+    nextendo/nextendo_toast.h
+    nextendo/nextendo_zip.cpp
+    nextendo/nextendo_zip.h
+
 )
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eden")
@@ -412,6 +431,8 @@ endif()
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
 target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent)
+# [Nextendo] In-memory ZIP for BCAT packages and cloud saves (nextendo/nextendo_zip.cpp).
+target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 target_link_libraries(yuzu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 if (ENABLE_OPENGL)
     target_link_libraries(yuzu PRIVATE glad)

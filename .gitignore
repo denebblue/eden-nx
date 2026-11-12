@@ -64,3 +64,4 @@ artifacts
 /install*
 vulkansdk*.exe
 *.tar.zst
+src/web_service/nextendo_secrets.h

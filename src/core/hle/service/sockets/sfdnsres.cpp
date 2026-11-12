@@ -4,14 +4,26 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <mutex>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "common/settings.h"
 #include "common/string_util.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/hle/kernel/svc/nextendo_deadline_watch.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/sockets/nextendo_uch.h"
 #include "core/hle/service/sockets/sfdnsres.h"
 #include "core/hle/service/sockets/sockets.h"
 #include "core/hle/service/sockets/sockets_translate.h"
@@ -29,13 +41,13 @@ SFDNSRES::SFDNSRES(Core::System& system_) : ServiceFramework{system_, "sfdnsres"
         {4, nullptr, "GetHostStringErrorRequest"},
         {5, &SFDNSRES::GetGaiStringErrorRequest, "GetGaiStringErrorRequest"},
         {6, &SFDNSRES::GetAddrInfoRequest, "GetAddrInfoRequest"},
-        {7, nullptr, "GetNameInfoRequest"},
-        {8, nullptr, "RequestCancelHandleRequest"},
-        {9, nullptr, "CancelRequest"},
+        {7, &SFDNSRES::GetNameInfoRequest, "GetNameInfoRequest"},
+        {8, &SFDNSRES::GetCancelHandleRequest, "RequestCancelHandleRequest"},
+        {9, &SFDNSRES::CancelRequest, "CancelRequest"},
         {10, &SFDNSRES::GetHostByNameRequestWithOptions, "GetHostByNameRequestWithOptions"},
         {11, nullptr, "GetHostByAddrRequestWithOptions"},
         {12, &SFDNSRES::GetAddrInfoRequestWithOptions, "GetAddrInfoRequestWithOptions"},
-        {13, nullptr, "GetNameInfoRequestWithOptions"},
+        {13, &SFDNSRES::GetNameInfoRequestWithOptions, "GetNameInfoRequestWithOptions"},
         {14, &SFDNSRES::ResolverSetOptionRequest, "ResolverSetOptionRequest"},
         {15, nullptr, "ResolverGetOptionRequest"},
     };
@@ -43,6 +55,334 @@ SFDNSRES::SFDNSRES(Core::System& system_) : ServiceFramework{system_, "sfdnsres"
 }
 
 SFDNSRES::~SFDNSRES() = default;
+
+static std::mutex g_last_host_mutex;
+static std::unordered_map<std::string, std::string> g_last_host_for_ip;
+
+void SetLastHostForIp(const std::string& ip, const std::string& host) {
+    std::lock_guard lock(g_last_host_mutex);
+    g_last_host_for_ip[ip] = host;
+}
+
+std::string GetLastHostForIp(const std::string& ip) {
+    std::lock_guard lock(g_last_host_mutex);
+    auto it = g_last_host_for_ip.find(ip);
+    if (it != g_last_host_for_ip.end()) {
+        return it->second;
+    }
+    return "";
+}
+
+// [Nextendo] See sfdnsres.h's declaration comment. Real bug this exists for (Splatoon 3,
+// confirmed via Ryujinx-Nextendo hitting the identical failure on the same guest binary):
+// its gRPC channel resolves a redirected Nextendo hostname correctly here, then later loses
+// that address in its own connection-establishment plumbing and calls connect() with a
+// zeroed IP -- but the SAME port it originally resolved for. Recording "port -> resolved IP"
+// at resolution time lets BSD::ConnectImpl recover the real address for that exact port.
+static std::mutex g_last_ip_for_port_mutex;
+static std::unordered_map<u16, Network::IPv4Address> g_last_ip_for_port;
+
+void SetLastIpForPort(u16 port, Network::IPv4Address ip) {
+    if (port == 0) {
+        return;
+    }
+    std::lock_guard lock(g_last_ip_for_port_mutex);
+    g_last_ip_for_port[port] = ip;
+}
+
+std::optional<Network::IPv4Address> GetLastIpForPort(u16 port) {
+    if (port == 0) {
+        return std::nullopt;
+    }
+    std::lock_guard lock(g_last_ip_for_port_mutex);
+    auto it = g_last_ip_for_port.find(port);
+    if (it != g_last_ip_for_port.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
+// No server address is baked in: unconfigured builds fall back to loopback and redirect nowhere.
+static std::string GetConfiguredIp(const std::string& setting, const char* env_var) {
+    if (!setting.empty()) {
+        return setting;
+    }
+    if (const char* env = std::getenv(env_var); env && *env) {
+        return env;
+    }
+    return "127.0.0.1";
+}
+
+// [Nextendo] La redirection est-elle active ?
+//
+// Le reglage « enable_nextendo » n'existe QUE dans la facade Qt (src/citron/main.cpp) : la facade
+// SDL (citron_cmd) ne le cable nulle part et le reecrit a sa valeur par defaut, false, au
+// demarrage. Mesure du 2026-08-25 : lance par citron-cmd, Splatoon 3 a resolu
+// « t-dce9377b-lp1.lp1.t.npln.srv.nintendo.net » vers 34.49.112.177 — le VRAI serveur de Nintendo —
+// alors que le fichier de configuration portait bien enable_nextendo=true.
+//
+// On accepte donc aussi une activation par l'environnement, exactement comme GetConfiguredIp le
+// fait deja pour les deux adresses. Une valeur vide, « 0 », « false » ou « no » ne l'active pas.
+static bool RedirectionNextendoActive() {
+    if (Settings::values.enable_nextendo.GetValue()) {
+        return true;
+    }
+    const char* env = std::getenv("NEXTENDO_ENABLE");
+    if (env == nullptr || *env == '\0') {
+        return false;
+    }
+    const std::string v = Common::ToLower(env);
+    return v != "0" && v != "false" && v != "no" && v != "off";
+}
+
+std::optional<Network::IPv4Address> GetNextendoServerAddress() {
+    if (!RedirectionNextendoActive()) {
+        return std::nullopt;
+    }
+    Network::IPv4Address ip{};
+    if (!Network::TryParseIPv4Literal(
+            GetConfiguredIp(Settings::values.nextendo_server_ip.GetValue(), "NEXTENDO_SERVER_IP"),
+            ip)) {
+        return std::nullopt;
+    }
+    return ip;
+}
+
+static std::optional<std::string> GetNextendoRedirectIp(const std::string& host, u64 program_id) {
+    if (!RedirectionNextendoActive()) {
+        return std::nullopt;
+    }
+
+    const std::string server_ip =
+        GetConfiguredIp(Settings::values.nextendo_server_ip.GetValue(), "NEXTENDO_SERVER_IP");
+    const std::string nat_ip =
+        GetConfiguredIp(Settings::values.nextendo_nat_ip.GetValue(), "NEXTENDO_NAT_IP");
+
+    // Only PvZ BfN's Blaze hosts; other EA traffic and titles keep their normal DNS.
+    constexpr u64 PvZBattleForNeighborville = 0x0100C56010FD8000ULL;
+    if (program_id == PvZBattleForNeighborville &&
+        (host == "spring18.gosredirector.ea.com" ||
+         (host.starts_with("pvzgw3prodapp-") && host.ends_with(".ea.com")))) {
+        LOG_INFO(Service, "[Nextendo] Redirecting PVZ BFN Blaze host '{}' -> '{}'", host,
+                 server_ip);
+        return server_ip;
+    }
+
+    // Dragon Ball FighterZ signs in to Bandai Namco's own API before any NEX traffic.
+    constexpr u64 DragonBallFighterZ = 0x0100A250097F0000ULL;
+    if (program_id == DragonBallFighterZ && host == "dbf.channel.or.jp") {
+        LOG_INFO(Service, "[Nextendo] Redirecting DBFZ API host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Friday the 13th logs in to IllFonic's own REST backend right after NEX Register.
+    constexpr u64 FridayThe13th = 0x010092A00C4B6000ULL;
+    if (program_id == FridayThe13th && host == "nswitch.f13.illfonic.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting Friday the 13th backend '{}' -> '{}'", host,
+                 server_ip);
+        return server_ip;
+    }
+
+    // Sonic Racing CrossWorlds signs in to Epic Online Services, then to SEGA's own backend
+    // (prod-api/prod-cdn.sora-online.net); our stand-in serves both. EOS P2P relays through
+    // Epic's TURN host with credentials our server issues, so that host goes to our coturn.
+    constexpr u64 SonicRacingCrossWorlds = 0x01006E001823C000ULL;
+    if (program_id == SonicRacingCrossWorlds &&
+        (host == "api.epicgames.dev" || host == "prod-api.sora-online.net" ||
+         host == "prod-cdn.sora-online.net" || host == "turn.rtcp.on.epicgames.com")) {
+        LOG_INFO(Service, "Redirecting CrossWorlds host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Among Us signs in to Epic Online Services, then to Innersloth's account service, and finds
+    // rooms through three regional matchmakers. api.epicgames.dev is shared with other Epic titles,
+    // so it is redirected only while Among Us runs; the Nextendo server forwards anything that is
+    // not Among Us to the real Epic.
+    constexpr u64 AmongUs = 0x0100B0C013912000ULL;
+    if (program_id == AmongUs &&
+        (host == "api.epicgames.dev" || host == "backend.innersloth.com" ||
+         host == "matchmaker.among.us" || host == "matchmaker-eu.among.us" ||
+         host == "matchmaker-as.among.us")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Among Us host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Guilty Gear -Strive- signs in to Epic Online Services at boot, then calls Arc System Works'
+    // API and its two match servers when the player goes online. api.epicgames.dev is shared with
+    // other Epic titles, so it is redirected only while Strive runs. NEXTENDO_GGST_IP points the
+    // four hosts at a local test server without moving the rest of Nextendo.
+    // 0100AB401F136000 is the analysed release (JP cartridge, update 1.08). The US, EU and Asian
+    // IDs come from their DLC/listing IDs and are not checked against a binary yet.
+    const bool is_guilty_gear_strive =
+        program_id == 0x0100AB401F136000ULL || program_id == 0x01002F4020718000ULL ||
+        program_id == 0x01002F402071A000ULL || program_id == 0x010034A020A5C000ULL;
+    if (is_guilty_gear_strive &&
+        (host == "api.epicgames.dev" || host == "switch-ggst-game.guiltygear.com" ||
+         host == "prod-switch-match-ggst-game.guiltygear.com" ||
+         host == "prod-to3match-ggst-game.guiltygear.com")) {
+        const char* ggst_ip = std::getenv("NEXTENDO_GGST_IP");
+        const std::string target = (ggst_ip && *ggst_ip) ? std::string{ggst_ip} : server_ip;
+        LOG_INFO(Service, "[Nextendo] Redirecting Guilty Gear Strive host '{}' -> '{}'", host,
+                 target);
+        return target;
+    }
+
+    // Just Dance 2022: exact service hosts on the lab or deployed Nextendo server.
+    constexpr u64 JustDance2022 = 0x0100EA6014BB8000ULL;
+    if (program_id == JustDance2022 &&
+        (server_ip == "127.0.0.5" || server_ip == "51.178.29.194") &&
+        (host == "public-ubiservices.ubi.com" ||
+         host == "public-ws-ubiservices.ubi.com" || host == "jd.ubisoft.com" ||
+         host == "phonescoring.jd.ubisoft.com" ||
+         host == "v2.phonescoring.jd.ubisoft.com")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Just Dance host '{}' -> '{}'",
+                 host, server_ip);
+        return server_ip;
+    }
+
+    // UNO signs in through Ubisoft's public services endpoint before any matchmaking. The
+    // redirect is limited to that exact host while UNO runs; other Ubisoft titles are untouched.
+    constexpr u64 Uno = 0x0100B6E012EBE000ULL;
+    if (program_id == Uno && host == "public-ubiservices.ubi.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting UNO host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Ultimate Chicken Horse: brainCloud RPC and its three regional allocation hosts, the same names
+    // Prelude writes into the hosts file. Limited to the title so no other game is redirected.
+    if (NextendoUch::IsTitle(program_id) && NextendoUch::IsServiceHost(host)) {
+        LOG_INFO(Service, "[Nextendo] Redirecting UCH host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // SpeedRunners 2 signs in to brainCloud before it uses Photon for rooms. The brainCloud host is shared
+    // with Ultimate Chicken Horse, so redirects apply only while SpeedRunners 2 runs and only for these
+    // exact hosts. Photon matchmaking and gameplay are served independently by Nextendo.
+    constexpr u64 SpeedRunners2 = 0x01004CC023582000ULL;
+    if (program_id == SpeedRunners2 &&
+        (host == "api.braincloudservers.com" || host == "ns.photonengine.io" ||
+         host == "api.gameanalytics.com")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting SpeedRunners 2 host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Crypt of the NecroDancer signs in to brainCloud for its online services.
+    // The host is shared with other brainCloud titles, so it is redirected only while NecroDancer
+    // runs. vortexbuffer.com, which the game also contacts, keeps resolving normally.
+    constexpr u64 CryptOfTheNecroDancer = 0x0100CEA007D08000ULL;
+    if (program_id == CryptOfTheNecroDancer && host == "api.braincloudservers.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting NecroDancer host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // World War Z: Saber's Hydra API (wwz*.wwzapi.com) and RedLynx dispatcher (rlx*.hydrapi.net).
+    constexpr u64 WorldWarZ = 0x010099F013898000ULL;
+    if (program_id == WorldWarZ &&
+        (host.ends_with(".wwzapi.com") || host.ends_with(".hydrapi.net"))) {
+        LOG_INFO(Service, "Redirecting World War Z host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    if (host.starts_with("nncs2-") && host.ends_with(".n.n.srv.nintendo.net")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting NAT check host '{}' -> '{}'", host, nat_ip);
+        return nat_ip;
+    }
+
+    if (host == "nintendo.net" || host.ends_with(".nintendo.net") ||
+        host == "nintendo.com" || host.ends_with(".nintendo.com") ||
+        host == "nintendowifi.net" || host.ends_with(".nintendowifi.net") ||
+        host == "nintendo.co.jp" || host.ends_with(".nintendo.co.jp")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Nintendo host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Minecraft Dungeons II uses this PlayFab title for its online bootstrap.
+    // Keep the redirect title-specific; other PlayFab games use different services.
+    if (host == "83156.playfabapi.com" || host == "vex.minecraftservices.com" ||
+        host == "s2s-vex.minecraftservices.com") {
+        LOG_INFO(Service, "[Nextendo] Redirecting Dungeons II host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+    // Its Xbox Live sign-in (XAL) too, but only while Dungeons II runs: other titles may use
+    // real Xbox Live accounts.
+    constexpr u64 DungeonsII = 0x0100A7C01B792000ULL;
+    if (program_id == DungeonsII &&
+        (host == "xboxlive.com" || host.ends_with(".xboxlive.com") || host == "login.live.com")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Dungeons II host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    // Titles published by Activision/Blizzard reach Demonware rather than Nintendo's own
+    // services: auth over TLS, the lobby and NAT discovery on 3074, and the shared
+    // stun.<region>.demonware.net responders.
+    if (host == "demonware.net" || host.ends_with(".demonware.net")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Demonware host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
+    return std::nullopt;
+}
+
+// [Nextendo] Debug-only tap: redirects an "npln" host straight to a local TLS-terminating
+// proxy instead of production, for protocol inspection. Independent of enable_nextendo (this
+// isn't a Nextendo-server redirect, just a temporary debugging aid) -- unset by default, so it
+// never affects a normal run. NEXTENDO_S3_DEBUG_PROXY_IP=<ip> to enable.
+static std::optional<std::string> GetNplnDebugProxyIp(const std::string& host) {
+    if (Common::ToLower(host).find("npln") == std::string::npos) {
+        return std::nullopt;
+    }
+    const char* env = std::getenv("NEXTENDO_S3_DEBUG_PROXY_IP");
+    if (!env || !*env) {
+        return std::nullopt;
+    }
+    LOG_INFO(Service, "[Nextendo] Redirecting npln host '{}' -> debug proxy '{}'", host, env);
+    return std::string(env);
+}
+
+// [Nextendo] Optional delay before the first "npln" host resolution, against a hypothesized
+// startup deadlock. Disabled by default (max_wait_ms=0) -- unconfirmed benefit, and a nonzero
+// delay now blocks every other socket IPC call too (bsdsocket is single-threaded).
+// NEXTENDO_NPLN_DELAY_MS opts back into a fixed wait if ever needed.
+static std::once_flag g_npln_delay_once;
+
+static void MaybeDelayNplnInit(const std::string& host) {
+    if (Common::ToLower(host).find("npln") == std::string::npos) {
+        return;
+    }
+    std::call_once(g_npln_delay_once, [] {
+        int max_wait_ms = 0;
+        if (const char* env = std::getenv("NEXTENDO_NPLN_DELAY_MS"); env && *env) {
+            try {
+                const int parsed = std::stoi(env);
+                if (parsed >= 0) {
+                    max_wait_ms = parsed;
+                }
+            } catch (const std::exception&) {
+                // Malformed override -- keep the default rather than fail resolution over it.
+            }
+        }
+        if (max_wait_ms <= 0) {
+            return;
+        }
+
+        LOG_INFO(Service,
+                 "[Nextendo] Holding the first npln host resolution until the JIT/shader-compile "
+                 "burst settles before gRPC's connection setup starts ({} ms) (see "
+                 "MaybeDelayNplnInit)",
+                 max_wait_ms);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(max_wait_ms));
+
+        LOG_INFO(Service, "[Nextendo] npln hold finished after {} ms", max_wait_ms);
+
+        // [Nextendo][DIAG] Arm a short window during which any finite, non-trivial
+        // WaitSynchronization timeout gets logged -- see nextendo_deadline_watch.h. This is
+        // trying to directly OBSERVE the game's gRPC call deadline (if it's implemented as a
+        // timed kernel wait) rather than continuing to guess at it via static binary analysis.
+        Kernel::Svc::ArmNextendoDeadlineWatch(90000);
+        LOG_INFO(Service, "[Nextendo][DIAG] Deadline watch armed for 90000 ms");
+    });
+}
 
 enum class NetDbError : s32 {
     Internal = -1,
@@ -137,6 +477,9 @@ static Errno GetAddrInfoErrorToErrno(GetAddrInfoError result) {
     }
 }
 
+// Size of a BSD sockaddr_in on the wire (len, family, port, addr, zero[8]).
+constexpr std::size_t SockAddrInWireSize = 16;
+
 template <typename T>
 static void Append(std::vector<u8>& vec, T t) {
     const size_t offset = vec.size();
@@ -181,7 +524,8 @@ static std::vector<u8> SerializeAddrInfoAsHostEnt(const std::vector<Network::Add
     return data;
 }
 
-static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestContext& ctx) {
+static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestContext& ctx,
+                                                                 u64 program_id) {
     struct InputParameters {
         u8 use_nsd_resolve;
         u32 cancel_handle;
@@ -198,18 +542,45 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
         parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
 
     const auto host_buffer = ctx.ReadBuffer(0);
-    const std::string host = Common::StringFromBuffer(host_buffer);
+    std::string host = Common::StringFromBuffer(host_buffer);
     // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
 
-    // Prevent resolution of Nintendo servers
-    if (IsBlockedHost(host)) {
+    LOG_INFO(Service, "[Nextendo] DNS resolve (GetHostByName) requested: host={}", host);
+
+    // [Nextendo] See MaybeDelayNplnInit's declaration comment.
+    MaybeDelayNplnInit(host);
+
+    if (parameters.use_nsd_resolve || host.find('%') != std::string::npos) {
+        auto pos = host.find('%');
+        if (pos != std::string::npos) {
+            host.replace(pos, 1, "lp1");
+        }
+        if (host == "api.accounts.nintendo.com" || host == "accounts.nintendo.com") {
+            host = "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
+        }
+        LOG_INFO(Service, "[sfdnsres] NSD resolved host to '{}'", host);
+    }
+
+    // [Nextendo] A redirect takes priority over Eden's blocklist; the blocklist still applies
+    // to every host Nextendo does not redirect (and to everything when Nextendo is off).
+    std::string query_host = host;
+    auto redirect = GetNextendoRedirectIp(host, program_id);
+    if (redirect.has_value()) {
+        query_host = *redirect;
+    } else if (IsBlockedHost(host)) {
         LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
         return {0, GetAddrInfoError::AGAIN};
     }
 
-    auto res = Network::GetAddressInfo(host, /*service*/ std::nullopt);
+    auto res = Network::GetAddressInfo(query_host, /*service*/ std::nullopt);
     if (!res.has_value()) {
         return {0, Translate(res.error())};
+    }
+
+    if (redirect.has_value()) {
+        for (const auto& addrinfo : res.value()) {
+            SetLastHostForIp(Network::IPv4AddressToString(addrinfo.addr.ip), host);
+        }
     }
 
     const std::vector<u8> data = SerializeAddrInfoAsHostEnt(res.value(), host);
@@ -220,7 +591,8 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
 }
 
 void SFDNSRES::GetHostByNameRequest(HLERequestContext& ctx) {
-    auto [data_size, emu_gai_err] = GetHostByNameRequestImpl(ctx);
+    auto [data_size, emu_gai_err] =
+        GetHostByNameRequestImpl(ctx, system.GetApplicationProcessProgramID());
 
     struct OutputParameters {
         NetDbError netdb_error;
@@ -239,7 +611,8 @@ void SFDNSRES::GetHostByNameRequest(HLERequestContext& ctx) {
 }
 
 void SFDNSRES::GetHostByNameRequestWithOptions(HLERequestContext& ctx) {
-    auto [data_size, emu_gai_err] = GetHostByNameRequestImpl(ctx);
+    auto [data_size, emu_gai_err] =
+        GetHostByNameRequestImpl(ctx, system.GetApplicationProcessProgramID());
 
     struct OutputParameters {
         u32 data_size;
@@ -273,8 +646,20 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
         Append<u32_be>(data, 16); // ai_addrlen
         // ^ *not* sizeof(SerializedSockAddrIn), not that it matters since they're the same size
 
-        // ai_addr:
-        Append<u16_be>(data, static_cast<u16>(Translate(addrinfo.addr.family))); // sin_family
+        // ai_addr: BSD-style sockaddr_in, matching the SockAddrIn struct in sockets.h --
+        // {u8 sin_len; u8 sin_family; u16 sin_port; u8 sin_addr[4]; u8 sin_zero[8];}. This used
+        // to write sin_family as a single 2-byte big-endian value, which skips sin_len entirely
+        // (leaving it implicitly 0x00) instead of emitting it as its own leading byte. A guest
+        // resolver walker that trusts sin_len -- and gRPC-based titles (Splatoon 3) that build
+        // their own connect() sockaddr straight out of this buffer -- reads a zero-length
+        // address off a sin_len of 0 and falls back to connecting to 0.0.0.0. Exactly matches
+        // Ryujinx-Nextendo's AddrInfo4.Length fix (was sizeof(Array4<byte>)=4, needed to be
+        // sizeof(AddrInfo4)=16): sin_len must be the full sockaddr size, not folded away.
+        // [Nextendo]
+        // Eden's guest SockAddrIn (sockets.h) is padded to 0x100 bytes, so use the real
+        // 16-byte sockaddr_in size here instead of sizeof(SockAddrIn).
+        Append<u8>(data, static_cast<u8>(SockAddrInWireSize));               // sin_len
+        Append<u8>(data, static_cast<u8>(Translate(addrinfo.addr.family))); // sin_family
         // On the Switch, the following fields are passed through htonl despite
         // already being big-endian, so they end up as little-endian.
         Append<u16_le>(data, addrinfo.addr.portno);                            // sin_port
@@ -296,7 +681,8 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
     return data;
 }
 
-static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext& ctx) {
+static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext& ctx,
+                                                               u64 program_id) {
     struct InputParameters {
         u8 use_nsd_resolve;
         u32 cancel_handle;
@@ -312,29 +698,130 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
         "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
         parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
 
-    // TODO: If use_nsd_resolve is true, pass the name through NSD::Resolve
-    // before looking up.
-
     const auto host_buffer = ctx.ReadBuffer(0);
-    const std::string host = Common::StringFromBuffer(host_buffer);
+    std::string host = Common::StringFromBuffer(host_buffer);
 
-    // Prevent resolution of Nintendo servers
-    if (IsBlockedHost(host)) {
-        LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
-        return {0, GetAddrInfoError::AGAIN};
-    }
+    LOG_INFO(Service, "[Nextendo] DNS resolve (GetAddrInfo) requested: host={}", host);
 
+    // [Nextendo] See MaybeDelayNplnInit's declaration comment.
+    MaybeDelayNplnInit(host);
+
+    // [Nextendo] A literal IP has nothing to resolve -- return it as-is, before any of the
+    // redirect/blocklist/NSD-rewrite logic below, all of which exist to turn a HOSTNAME into
+    // the right address and have no business touching an address that's already one. See
+    // TryParseIPv4Literal's declaration comment in internal_network/network.h. Falling through
+    // to a real resolution here made Splatoon 3's gRPC stack build its HTTP/2 :authority from a
+    // corrupted canonical name and close its NPLN connections right after the TLS handshake.
     std::optional<std::string> service = std::nullopt;
     if (ctx.CanReadBuffer(1)) {
         const std::span<const u8> service_buffer = ctx.ReadBuffer(1);
         service = Common::StringFromBuffer(service_buffer);
     }
 
+    if (Network::IPv4Address literal_ip; Network::TryParseIPv4Literal(host, literal_ip)) {
+        u32 requested_type = 0;
+        u32 requested_protocol = 0;
+        if (ctx.CanReadBuffer(2)) {
+            const auto hints = ctx.ReadBuffer(2);
+            if (hints.size() >= 24) {
+                std::array<u32_be, 6> header{};
+                std::memcpy(header.data(), hints.data(), sizeof(header));
+                if (header[0] == 0xBEEFCAFE) {
+                    requested_type = header[3];
+                    requested_protocol = header[4];
+                }
+            }
+        }
+        const bool udp = requested_type == static_cast<u32>(Type::DGRAM) ||
+                         requested_protocol == static_cast<u32>(Protocol::UDP);
+        u16 literal_port = 0;
+        if (service.has_value() && !service->empty()) {
+            const char* const first = service->data();
+            const char* const last = first + service->size();
+            const auto [end, ec] = std::from_chars(first, last, literal_port);
+            if (ec != std::errc{} || end != last) {
+                return {0, GetAddrInfoError::SERVICE};
+            }
+        }
+        LOG_DEBUG(Service, "[Nextendo] Host '{}' is already a literal address: returned as-is",
+                  host);
+        Network::AddrInfo entry{};
+        entry.family = Network::Domain::INET;
+        entry.socket_type = udp ? Network::Type::DGRAM : Network::Type::STREAM;
+        entry.protocol = udp ? Network::Protocol::UDP : Network::Protocol::TCP;
+        entry.addr.family = Network::Domain::INET;
+        entry.addr.ip = literal_ip;
+        entry.addr.portno = literal_port;
+        entry.canon_name = host;
+
+        // Deliberately no SetLastHostForIp here, matching Ryujinx-Nextendo's own fix -- a
+        // literal IP carries no hostname to record, and recording one would corrupt the
+        // reverse lookup table (see GetLastHostForIp).
+        const std::vector<u8> data = SerializeAddrInfo({entry}, host);
+        const u32 data_size = static_cast<u32>(data.size());
+        ctx.WriteBuffer(data, 0);
+        return {data_size, GetAddrInfoError::SUCCESS};
+    }
+
+    if (parameters.use_nsd_resolve || host.find('%') != std::string::npos) {
+        auto pos = host.find('%');
+        if (pos != std::string::npos) {
+            host.replace(pos, 1, "lp1");
+        }
+        if (host == "api.accounts.nintendo.com" || host == "accounts.nintendo.com") {
+            host = "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
+        }
+        LOG_INFO(Service, "[sfdnsres] NSD resolved host to '{}'", host);
+    }
+
+    // [Nextendo] A redirect takes priority over Eden's blocklist; the blocklist still applies
+    // to every host Nextendo does not redirect (and to everything when Nextendo is off).
+    std::string query_host = host;
+    auto redirect = GetNplnDebugProxyIp(host);
+    if (!redirect.has_value()) {
+        redirect = GetNextendoRedirectIp(host, program_id);
+    }
+    if (redirect.has_value()) {
+        query_host = *redirect;
+    } else if (IsBlockedHost(host)) {
+        LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
+        return {0, GetAddrInfoError::AGAIN};
+    }
+
     // Serialized hints are also passed in a buffer, but are ignored for now.
 
-    auto res = Network::GetAddressInfo(host, service);
+    auto res = Network::GetAddressInfo(query_host, service);
     if (!res.has_value()) {
         return {0, Translate(res.error())};
+    }
+
+    if (redirect.has_value()) {
+        // [Nextendo] This query resolved a REDIRECT TARGET (a literal IP string), not the real
+        // host, so canon_name is empty or the numeric IP. gRPC-based titles (Splatoon 3) build
+        // their HTTP/2 :authority header from it; force it back to the real host name.
+        for (auto& addrinfo : res.value()) {
+            addrinfo.canon_name = host;
+        }
+
+        // [Nextendo] Port-keyed recovery for gRPC-based titles (Splatoon 3) that lose this
+        // resolved address later. See SetLastIpForPort's declaration comment in sfdnsres.h.
+        std::optional<u16> service_port;
+        if (service.has_value()) {
+            try {
+                const int parsed = std::stoi(*service);
+                if (parsed > 0 && parsed <= 0xFFFF) {
+                    service_port = static_cast<u16>(parsed);
+                }
+            } catch (const std::exception&) {
+                // Named service (e.g. "http"): nothing to key the fallback on.
+            }
+        }
+        for (const auto& addrinfo : res.value()) {
+            SetLastHostForIp(Network::IPv4AddressToString(addrinfo.addr.ip), host);
+            if (service_port.has_value()) {
+                SetLastIpForPort(*service_port, addrinfo.addr.ip);
+            }
+        }
     }
 
     const std::vector<u8> data = SerializeAddrInfo(res.value(), host);
@@ -345,7 +832,8 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
 }
 
 void SFDNSRES::GetAddrInfoRequest(HLERequestContext& ctx) {
-    auto [data_size, emu_gai_err] = GetAddrInfoRequestImpl(ctx);
+    auto [data_size, emu_gai_err] =
+        GetAddrInfoRequestImpl(ctx, system.GetApplicationProcessProgramID());
 
     struct OutputParameters {
         Errno bsd_errno;
@@ -379,7 +867,8 @@ void SFDNSRES::GetGaiStringErrorRequest(HLERequestContext& ctx) {
 
 void SFDNSRES::GetAddrInfoRequestWithOptions(HLERequestContext& ctx) {
     // Additional options are ignored
-    auto [data_size, emu_gai_err] = GetAddrInfoRequestImpl(ctx);
+    auto [data_size, emu_gai_err] =
+        GetAddrInfoRequestImpl(ctx, system.GetApplicationProcessProgramID());
 
     struct OutputParameters {
         u32 data_size;
@@ -407,4 +896,73 @@ void SFDNSRES::ResolverSetOptionRequest(HLERequestContext& ctx) {
     rb.Push(ResultSuccess);
     rb.Push<s32>(0); // bsd errno
 }
+
+void SFDNSRES::GetCancelHandleRequest(HLERequestContext& ctx) {
+    LOG_WARNING(Service, "(STUBBED) sfdnsres::GetCancelHandleRequest called");
+    // GetCancelHandleRequest(u64 pid_placeholder, pid) -> u32 handle
+    IPC::ResponseBuilder rb{ctx, 3};
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(0);
+}
+
+void SFDNSRES::CancelRequest(HLERequestContext& ctx) {
+    LOG_WARNING(Service, "(STUBBED) sfdnsres::CancelRequest called");
+    IPC::ResponseBuilder rb{ctx, 2};
+    rb.Push(ResultSuccess);
+}
+
+// Numeric getnameinfo: Unreal's FInternetAddr::ToString returns "" when this fails, leaving P2P
+// joins with no host to connect to. Buffers: in 0 = sockaddr, out 0 = host, out 1 = service.
+static GetAddrInfoError GetNameInfoImpl(HLERequestContext& ctx) {
+    const auto addr_buffer = ctx.ReadBuffer(0);
+    // Eden's guest SockAddrIn is padded to 0x100 bytes, but the guest sends a 16-byte
+    // sockaddr_in: check against that and copy only what is there.
+    if (addr_buffer.size() < SockAddrInWireSize) {
+        return GetAddrInfoError::FAIL;
+    }
+    SockAddrIn addr{};
+    std::memcpy(&addr, addr_buffer.data(), (std::min)(sizeof(addr), addr_buffer.size()));
+    if (addr.family != static_cast<u8>(Domain::INET)) {
+        return GetAddrInfoError::FAMILY;
+    }
+
+    const std::string host = Network::IPv4AddressToString(addr.ip);
+    const std::string service = std::to_string(Common::swap16(addr.portno));
+    LOG_DEBUG(Service, "GetNameInfo {}:{}", host, service);
+
+    const std::size_t host_size = ctx.CanWriteBuffer(0) ? ctx.GetWriteBufferSize(0) : 0;
+    const std::size_t service_size = ctx.CanWriteBuffer(1) ? ctx.GetWriteBufferSize(1) : 0;
+    if ((host_size != 0 && host.size() >= host_size) ||
+        (service_size != 0 && service.size() >= service_size)) {
+        return GetAddrInfoError::OVERFLOW_;
+    }
+    if (host_size != 0) {
+        ctx.WriteBuffer(host.c_str(), host.size() + 1, 0);
+    }
+    if (service_size != 0) {
+        ctx.WriteBuffer(service.c_str(), service.size() + 1, 1);
+    }
+    return GetAddrInfoError::SUCCESS;
+}
+
+void SFDNSRES::GetNameInfoRequest(HLERequestContext& ctx) {
+    const GetAddrInfoError gai_error = GetNameInfoImpl(ctx);
+
+    IPC::ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.PushEnum(gai_error);
+    rb.PushEnum(GetAddrInfoErrorToErrno(gai_error));
+}
+
+void SFDNSRES::GetNameInfoRequestWithOptions(HLERequestContext& ctx) {
+    const GetAddrInfoError gai_error = GetNameInfoImpl(ctx);
+
+    IPC::ResponseBuilder rb{ctx, 5};
+    rb.Push(ResultSuccess);
+    rb.PushEnum(gai_error);
+    rb.PushEnum(GetAddrInfoErrorToNetDbError(gai_error));
+    rb.PushEnum(GetAddrInfoErrorToErrno(gai_error));
+}
+
 } // namespace Service::Sockets
+

@@ -1,0 +1,93 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/.cpm-cache
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/cache@v4
+        with:
+          path: .cpm-cache
+          key: cpm-windows-${{ hashFiles('cpmfile.json', '**/cpmfile.json') }}
+          restore-keys: cpm-windows-
+
+      - name: Generate Nextendo client id header
+        shell: bash
+        env:
+          NEXTENDO_CLIENT_ID: ${{ secrets.NEXTENDO_CLIENT_ID }}
+        run: |
+          if [ -z "$NEXTENDO_CLIENT_ID" ]; then
+            echo "::error::NEXTENDO_CLIENT_ID secret is not set; the build would ship unauthenticated"
+            exit 1
+          fi
+          cat > src/web_service/nextendo_secrets.h <<EOF
+          #pragma once
+
+          namespace WebService::NextendoApi {
+          constexpr const char* AppClientId = "$NEXTENDO_CLIENT_ID";
+          }
+          EOF
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $env:VULKAN_SDK = (Get-ChildItem C:/VulkanSDK | Select-Object -First 1).FullName
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_USE_BUNDLED_QT=ON `
+            -DENABLE_QT_TRANSLATION=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-win | Out-Null
+          Copy-Item build/bin/* dist-win -Recurse -Exclude *.pdb,*.ilk,*.lib,*.exp
+          New-Item -ItemType Directory -Force dist-win/user | Out-Null  # modo portable
+          Compress-Archive -Path dist-win/* -DestinationPath eden-nextendo-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eden-nextendo-windows-x64
+          path: eden-nextendo-windows-x64.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: false

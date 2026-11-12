@@ -57,11 +57,19 @@ public:
 
     Errno SetLinger(bool enable, u32 linger) override;
 
+    std::tuple<bool, u32, Errno> GetLinger() override;
+
     Errno SetReuseAddr(bool enable) override;
 
     Errno SetBroadcast(bool enable) override;
 
     Errno SetKeepAlive(bool enable) override;
+
+    std::pair<bool, Errno> GetReuseAddr() override;
+
+    std::pair<bool, Errno> GetKeepAlive() override;
+
+    std::pair<bool, Errno> GetBroadcast() override;
 
     Errno SetSndBuf(u32 value) override;
 
@@ -73,6 +81,9 @@ public:
 
     Errno SetNonBlock(bool enable) override;
 
+    Errno SetNoDelay(bool enable) override;
+    std::pair<bool, Errno> GetNoDelay() override;
+
     template <typename T>
     Errno SetSockOpt(SOCKET fd, int option, T value);
 
@@ -82,6 +93,11 @@ public:
 
 private:
     bool broadcast = false;
+    bool no_delay = false;
+    bool reuse_addr = false;
+    bool keep_alive = false;
+    bool linger_enable = false;
+    u32 linger_time = 0;
     bool closed = false;
     u32 send_timeout = 0;
     u32 receive_timeout = 0;

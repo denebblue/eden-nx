@@ -8,6 +8,7 @@
 #include "core/frontend/applets/cabinet.h"
 #include "core/frontend/applets/controller.h"
 #include "core/frontend/applets/error.h"
+#include "core/frontend/applets/friend_invitation.h"
 #include "core/frontend/applets/general.h"
 #include "core/frontend/applets/mii_edit.h"
 #include "core/frontend/applets/net_connect.h"
@@ -23,6 +24,7 @@
 #include "core/hle/service/am/frontend/applet_error.h"
 #include "core/hle/service/am/frontend/applet_general.h"
 #include "core/hle/service/am/frontend/applet_mii_edit.h"
+#include "core/hle/service/am/frontend/applet_my_page.h"
 #include "core/hle/service/am/frontend/applet_net_connect.h"
 #include "core/hle/service/am/frontend/applet_profile_select.h"
 #include "core/hle/service/am/frontend/applet_software_keyboard.h"
@@ -85,13 +87,14 @@ FrontendAppletSet::FrontendAppletSet(CabinetApplet cabinet_applet,
                                      MiiEdit mii_edit_,
                                      ParentalControlsApplet parental_controls_applet,
                                      PhotoViewer photo_viewer_, ProfileSelect profile_select_,
-                                     SoftwareKeyboard software_keyboard_, WebBrowser web_browser_, NetConnect net_connect_)
+                                     SoftwareKeyboard software_keyboard_, WebBrowser web_browser_,
+                                     NetConnect net_connect_, FriendInvitation friend_invitation_)
     : cabinet{std::move(cabinet_applet)}, controller{std::move(controller_applet)},
       error{std::move(error_applet)}, mii_edit{std::move(mii_edit_)},
       parental_controls{std::move(parental_controls_applet)},
       photo_viewer{std::move(photo_viewer_)}, profile_select{std::move(profile_select_)},
       software_keyboard{std::move(software_keyboard_)}, web_browser{std::move(web_browser_)},
-      net_connect{std::move(net_connect_)} {}
+      net_connect{std::move(net_connect_)}, friend_invitation{std::move(friend_invitation_)} {}
 
 FrontendAppletSet::~FrontendAppletSet() = default;
 
@@ -154,6 +157,10 @@ void FrontendAppletHolder::SetFrontendAppletSet(FrontendAppletSet set) {
 
     if (set.net_connect != nullptr) {
         frontend.net_connect = std::move(set.net_connect);
+    }
+
+    if (set.friend_invitation != nullptr) {
+        frontend.friend_invitation = std::move(set.friend_invitation);
     }
 }
 
@@ -218,6 +225,8 @@ std::shared_ptr<FrontendApplet> FrontendAppletHolder::GetApplet(std::shared_ptr<
                                                                 AppletId id,
                                                                 LibraryAppletMode mode) const {
     switch (id) {
+    case AppletId::MyPage:
+        return std::make_shared<MyPage>(system, applet, mode, frontend.friend_invitation.get());
     case AppletId::Auth:
         return std::make_shared<Auth>(system, applet, mode, *frontend.parental_controls);
     case AppletId::Cabinet:

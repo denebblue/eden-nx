@@ -6,11 +6,27 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <mutex>
+#include <random>
+#include <span>
+#include <string>
+
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
 
 #include "common/common_types.h"
 #include "common/fs/file.h"
+#include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/nextendo_account.h"
+#include "common/nextendo_avatar.h"
+#include "common/nextendo_compatible_titles.h"
+#include "common/settings.h"
 #include <ranges>
 #include "common/stb.h"
 #include "common/string_util.h"
@@ -21,6 +37,9 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/service/acc/acc.h"
+#include "core/hle/service/acc/nextendo_account_country.h"
+#include "core/hle/service/acc/nextendo_baas_nsa.h"
+#include "core/hle/service/acc/nextendo_cached_account_info.h"
 #include "core/hle/service/acc/acc_aa.h"
 #include "core/hle/service/acc/acc_su.h"
 #include "core/hle/service/acc/acc_u0.h"
@@ -35,12 +54,359 @@
 
 namespace Service::Account {
 
+namespace {
+
+// The BAAS id_token read through LoadIdTokenCache. NEX parses it before logging in, so it must be
+// a real RS256 JWT. Key comes from NEXTENDO_BAAS_SIGNING_KEY or nextendo_baas.pem, else generated.
+constexpr const char* BaasIssuer = "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
+constexpr const char* BaasJku =
+    "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/1.0.0/certificates";
+constexpr const char* BaasAudience = "ed9e2f05d286f7b8";
+constexpr const char* BaasKeyId = "nextendo-baas-key-1";
+
+std::string Base64UrlEncode(std::span<const u8> data) {
+    static constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+
+    for (std::size_t i = 0; i < data.size(); i += 3) {
+        const u32 remaining = static_cast<u32>(data.size() - i);
+        const u32 triple = (static_cast<u32>(data[i]) << 16) |
+                           (remaining > 1 ? static_cast<u32>(data[i + 1]) << 8 : 0) |
+                           (remaining > 2 ? static_cast<u32>(data[i + 2]) : 0);
+
+        out += alphabet[(triple >> 18) & 0x3F];
+        out += alphabet[(triple >> 12) & 0x3F];
+        if (remaining > 1) {
+            out += alphabet[(triple >> 6) & 0x3F];
+        }
+        if (remaining > 2) {
+            out += alphabet[triple & 0x3F];
+        }
+    }
+
+    return out;
+}
+
+std::string Base64UrlEncode(std::string_view text) {
+    return Base64UrlEncode(
+        std::span{reinterpret_cast<const u8*>(text.data()), text.size()});
+}
+
+std::string RandomHex(std::size_t bytes) {
+    std::vector<u8> buffer(bytes);
+    if (RAND_bytes(buffer.data(), static_cast<int>(buffer.size())) != 1) {
+        for (std::size_t i = 0; i < buffer.size(); ++i) {
+            buffer[i] = static_cast<u8>(std::rand());
+        }
+    }
+    return Common::HexToString(buffer, /*upper=*/false);
+}
+
+EVP_PKEY* GetBaasSigningKey() {
+    static EVP_PKEY* key = []() -> EVP_PKEY* {
+        std::string pem;
+
+        if (const char* env = std::getenv("NEXTENDO_BAAS_SIGNING_KEY"); env && *env) {
+            pem = env;
+        } else if (const auto file = Common::FS::ReadStringFromFile(
+                       std::filesystem::path{"nextendo_baas.pem"}, Common::FS::FileType::TextFile);
+                   !file.empty()) {
+            pem = file;
+        }
+
+        if (pem.find("BEGIN") != std::string::npos) {
+            BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+            if (bio) {
+                EVP_PKEY* loaded = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+                BIO_free(bio);
+                if (loaded) {
+                    LOG_INFO(Service_ACC, "[Nextendo] Using the supplied BAAS signing key");
+                    return loaded;
+                }
+                LOG_WARNING(Service_ACC,
+                            "[Nextendo] BAAS signing key could not be parsed; generating one");
+            }
+        }
+
+        // No key supplied: reuse a persisted auto-generated one so the identity (and its
+        // public JWK) stays stable across launches instead of a fresh key every process start.
+        const auto auto_key_path =
+            Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir) / "nextendo_baas_auto.pem";
+        if (const auto existing =
+                Common::FS::ReadStringFromFile(auto_key_path, Common::FS::FileType::TextFile);
+            existing.find("BEGIN") != std::string::npos) {
+            BIO* bio = BIO_new_mem_buf(existing.data(), static_cast<int>(existing.size()));
+            if (bio) {
+                EVP_PKEY* loaded = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+                BIO_free(bio);
+                if (loaded) {
+                    LOG_DEBUG(Service_ACC, "[Nextendo] Using the persisted auto-generated BAAS signing key");
+                    return loaded;
+                }
+            }
+        }
+
+        EVP_PKEY* generated = EVP_RSA_gen(2048);
+        if (!generated) {
+            LOG_ERROR(Service_ACC, "[Nextendo] Failed to generate a BAAS signing key");
+            return generated;
+        }
+
+        BIO* out_bio = BIO_new(BIO_s_mem());
+        if (out_bio && PEM_write_bio_PrivateKey(out_bio, generated, nullptr, nullptr, 0, nullptr,
+                                                nullptr)) {
+            char* data = nullptr;
+            const long len = BIO_get_mem_data(out_bio, &data);
+            if (len > 0 && data) {
+                const auto written = Common::FS::WriteStringToFile(
+                    auto_key_path, Common::FS::FileType::TextFile,
+                    std::string_view{data, static_cast<size_t>(len)});
+                if (written > 0) {
+                    LOG_DEBUG(Service_ACC,
+                             "[Nextendo] Generated and persisted a new BAAS signing key at {}",
+                             auto_key_path.string());
+                }
+            }
+        }
+        if (out_bio) {
+            BIO_free(out_bio);
+        }
+        return generated;
+    }();
+
+    return key;
+}
+
+std::string SignRs256(std::string_view signing_input) {
+    EVP_PKEY* key = GetBaasSigningKey();
+    if (!key) {
+        return {};
+    }
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        return {};
+    }
+
+    std::string signature;
+    std::size_t length = 0;
+
+    if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, key) == 1 &&
+        EVP_DigestSign(ctx, nullptr, &length,
+                       reinterpret_cast<const u8*>(signing_input.data()),
+                       signing_input.size()) == 1) {
+        std::vector<u8> raw(length);
+        if (EVP_DigestSign(ctx, raw.data(), &length,
+                           reinterpret_cast<const u8*>(signing_input.data()),
+                           signing_input.size()) == 1) {
+            raw.resize(length);
+            signature = Base64UrlEncode(raw);
+        }
+    }
+
+    if (signature.empty()) {
+        LOG_ERROR(Service_ACC, "[Nextendo] Failed to sign the BAAS id_token");
+    }
+
+    EVP_MD_CTX_free(ctx);
+    return signature;
+}
+
+constexpr bool IsClassicsApplication(u64 program_id) {
+    switch (program_id) {
+    case 0x0100D870045B6000ULL: // NES
+    case 0x01008D300C50C000ULL: // SNES
+    case 0x0100C62011050000ULL: // Game Boy
+    case 0x010012F017576000ULL: // Game Boy Advance
+    case 0x0100C9A00ECE6000ULL: // Nintendo 64
+    case 0x0100B3C014BDA000ULL: // Mega Drive / Genesis
+        return true;
+    default:
+        return false;
+    }
+}
+
+u64 GetIdTokenProgramId(Core::System& system) {
+    const u64 program_id = system.GetApplicationProcessProgramID();
+    if (program_id != 0 || !system.IsPoweredOn()) {
+        return program_id;
+    }
+    // Use loaded application metadata only when a Classics process is not yet
+    // available through the application-process slot. Never infer identity from
+    // the account, network address or the previously running catalogue.
+    u64 loaded_id{};
+    if (system.GetAppLoader().ReadProgramId(loaded_id) == Loader::ResultStatus::Success &&
+        IsClassicsApplication(loaded_id)) {
+        return loaded_id;
+    }
+    return 0;
+}
+
+std::string GetInstalledTitleVersion(Core::System& system) {
+    const u64 program_id = GetIdTokenProgramId(system);
+    if (program_id == 0) {
+        return {};
+    }
+    const FileSys::PatchManager pm{program_id, system.GetFileSystemController(),
+                                   system.GetContentProvider()};
+    const auto metadata = pm.GetControlMetadata();
+    return metadata.first != nullptr ? metadata.first->GetVersionString() : std::string{};
+}
+
+u64 ConfiguredTestPid() {
+    const std::string pid_setting = Settings::values.nextendo_pid.GetValue();
+    if (!pid_setting.empty()) {
+        try {
+            return std::stoull(pid_setting);
+        } catch (...) {}
+    }
+    const char* pid_env = std::getenv("NEXTENDO_PID");
+    if (pid_env && *pid_env) {
+        try {
+            return std::stoull(pid_env);
+        } catch (...) {}
+    }
+    return 0;
+}
+
+std::string BuildIdToken(const std::string& installed_version, u64 program_id) {
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+
+    const std::string header =
+        fmt::format(R"({{"alg":"RS256","kid":"{}","typ":"id_token","jku":"{}"}})", BaasKeyId,
+                    BaasJku);
+
+    // [Nextendo] Ride the signed nx2 token in the "nnex" claim so the auth server can
+    // cryptographically bind this NEX login to the account (anti-impersonation).
+    std::string nnex_claim;
+    if (Common::NextendoAccount::IsLinked()) {
+        const std::string tok = Common::NextendoAccount::GetToken();
+        if (!tok.empty()) {
+            nnex_claim = fmt::format(R"("nnex":"{}",)", tok);
+        }
+    } else if (const u64 test_pid = ConfiguredTestPid(); test_pid != 0) {
+        // Unsigned test identity; NPLN servers only honour it in the bare-PID test range.
+        nnex_claim = fmt::format(R"("npid":"{}",)", test_pid);
+    }
+
+    // [Nextendo] The console's own nnAccount module expects a "nintendo" claim dictionary
+    // with device metadata (dt, pc, di, sn, ist) -- without it, nnAccount's local schema
+    // check rejects an otherwise well-formed, correctly-signed token even though the server
+    // side has nothing to complain about. Matches Ryujinx-Nextendo's own fix for the exact
+    // same shape of failure (their commit message: "the console receives HTTP 200 but
+    // rejects the body because the JWT schema doesn't match what nnAccount expects").
+    // Reuses the same device id for both the top-level "di" and the nested one, matching
+    // Ryujinx-Nextendo's own token (a single deviceId feeding both places).
+    const std::string device_id = RandomHex(0x10);
+    const std::string nintendo_claim = fmt::format(
+        R"("nintendo":{{"dt":"NX Prod 1","pc":"HAC","di":"{}","sn":"XAW10000000000","ist":false}},)",
+        device_id);
+
+    std::string tv_claim;
+    if (!installed_version.empty()) {
+        tv_claim = fmt::format(R"("tv":"{}",)", installed_version);
+    }
+    // Shared Classics endpoints need an explicit catalogue even when control
+    // metadata supplies no display version. The server still authenticates the
+    // enclosed Nextendo proof; this application ID is a routing scope only.
+    if (IsClassicsApplication(program_id) || program_id == 0x0100A3D008C5C000ULL ||
+        program_id == 0x0100559011740000ULL) {
+        tv_claim += fmt::format(R"("app_id":"{:016X}",)", program_id);
+    }
+
+    const std::string payload = fmt::format(
+        R"({{"sub":"{}","aud":"{}","iss":"{}","typ":"id_token","iat":{},"exp":{},"jku":"{}",)"
+        R"("jti":"{}","di":"{}","sn":"XAW10000000000","bs:did":"{}",{}{}{}"hm":true}})",
+        RandomHex(0x10), BaasAudience, BaasIssuer, now, now + 3 * 60 * 60, BaasJku,
+        Common::UUID::MakeRandom().FormattedString(), device_id, RandomHex(0x10),
+        nintendo_claim, nnex_claim, tv_claim);
+
+    const std::string signing_input =
+        Base64UrlEncode(header) + "." + Base64UrlEncode(payload);
+
+    return signing_input + "." + SignRs256(signing_input);
+}
+
+std::vector<u8> GetIdTokenBytes(Core::System& system) {
+    static std::mutex mutex;
+    static std::vector<u8> cached;
+    static std::chrono::steady_clock::time_point expiry{};
+    static u64 cached_generation = 0;
+    static std::string cached_version;
+    static u64 cached_test_pid = 0;
+    static u64 cached_program_id = 0;
+
+    std::lock_guard lock{mutex};
+
+    const u64 generation = Common::NextendoAccount::GetGeneration();
+    const std::string installed_version = GetInstalledTitleVersion(system);
+    const u64 test_pid = ConfiguredTestPid();
+    const u64 program_id = GetIdTokenProgramId(system);
+    const auto now = std::chrono::steady_clock::now();
+    if (cached.empty() || now >= expiry || generation != cached_generation ||
+        installed_version != cached_version || test_pid != cached_test_pid ||
+        program_id != cached_program_id) {
+        if (IsClassicsApplication(program_id)) {
+            LOG_INFO(Service_ACC,
+                     "[Nextendo] Classics authentication scope: title={:016X} version_present={}",
+                     program_id, !installed_version.empty());
+        }
+        const std::string token = BuildIdToken(installed_version, program_id);
+        cached.assign(token.begin(), token.end());
+        expiry = now + std::chrono::hours{2};
+        cached_generation = generation;
+        cached_version = installed_version;
+        cached_test_pid = test_pid;
+        cached_program_id = program_id;
+        LOG_INFO(Service_ACC, "[Nextendo] Issued a signed BAAS id_token ({} bytes)", cached.size());
+    }
+
+    return cached;
+}
+
+// Titles read the token as a C string, so zero the rest of their buffer instead of leaving stale bytes after it.
+void WriteIdToken(HLERequestContext& ctx, const std::vector<u8>& token) {
+    const std::size_t capacity = ctx.GetWriteBufferSize();
+    if (capacity == 0) {
+        return;
+    }
+    std::vector<u8> out(capacity, 0);
+    std::memcpy(out.data(), token.data(), std::min(token.size(), capacity));
+    ctx.WriteBuffer(out);
+}
+
+} // Anonymous namespace
+
 // Thumbnails are hard coded to be at least this size
 constexpr std::size_t THUMBNAIL_SIZE = 0x24000;
 
 static std::filesystem::path GetImagePath(const Common::UUID& uuid) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir) /
            fmt::format("system/save/8000000000000010/su/avators/{}.jpg", uuid.FormattedString());
+}
+
+static void SeedImageFromNextendoIfMissing(const Common::UUID& uuid) {
+    const auto path = GetImagePath(uuid);
+    if (Common::FS::Exists(path)) {
+        return;
+    }
+    if (!Common::NextendoAccount::IsLinked()) {
+        return;
+    }
+    const auto jpeg = Common::NextendoAvatar::GetSelfJPEG();
+    if (jpeg.empty()) {
+        return;
+    }
+    void(Common::FS::CreateParentDirs(path));
+    Common::FS::IOFile out(path, Common::FS::FileAccessMode::Write, Common::FS::FileType::BinaryFile);
+    if (out.IsOpen()) {
+        void(out.Write(jpeg));
+    }
 }
 
 static void JPGToMemory(void* context, void* data, int len) {
@@ -94,12 +460,13 @@ public:
             {113, nullptr, "GetServiceEntryRequirementCacheForOnlinePlay"}, // 6.1.0+
             {120, nullptr, "GetNintendoAccountId"},
             {121, nullptr, "CalculateNintendoAccountAuthenticationFingerprint"}, // 9.0.0+
-            {130, nullptr, "GetNintendoAccountUserResourceCache"},
+            {130, &IManagerForSystemService::GetNintendoAccountUserResourceCache, "GetNintendoAccountUserResourceCache"},
             {131, nullptr, "RefreshNintendoAccountUserResourceCacheAsync"},
             {132, nullptr, "RefreshNintendoAccountUserResourceCacheAsyncIfSecondsElapsed"},
             {133, nullptr, "GetNintendoAccountVerificationUrlCache"}, // 9.0.0+
             {134, nullptr, "RefreshNintendoAccountVerificationUrlCache"}, // 9.0.0+
             {135, nullptr, "RefreshNintendoAccountVerificationUrlCacheAsyncIfSecondsElapsed"}, // 9.0.0+
+            {136, &IManagerForSystemService::GetNintendoAccountUserResourceCache, "GetNintendoAccountUserResourceCache"}, // 19.0.0+
             {136, nullptr, "GetNintendoAccountUserResourceCache"}, // 19.0.0+
             {140, nullptr, "GetNetworkServiceLicenseCache"}, // 5.0.0+
             {141, nullptr, "RefreshNetworkServiceLicenseCacheAsync"}, // 5.0.0+
@@ -136,6 +503,24 @@ private:
     Result LoadIdTokenCache() {
         LOG_WARNING(Service_ACC, "(STUBBED) called");
         R_SUCCEED();
+    }
+
+    void GetNintendoAccountUserResourceCache(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_ACC, "[Nextendo] GetNintendoAccountUserResourceCache called");
+
+        const u64 pid = account_id.Hash();
+        std::vector<u8> nas_user_base(0x68, 0);
+        std::memcpy(nas_user_base.data(), &pid, sizeof(pid));
+        ctx.WriteBuffer(nas_user_base, 0);
+
+        if (ctx.CanWriteBuffer(1)) {
+            std::vector<u8> unknown_out_buffer(ctx.GetWriteBufferSize(1), 0);
+            ctx.WriteBuffer(unknown_out_buffer, 1);
+        }
+
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.PushRaw<u64>(pid);
     }
 
     Result GetNetworkServiceLicenseCacheEx(Out<u32> out_license, Out<s64> out_expiration) {
@@ -458,6 +843,8 @@ protected:
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
 
+        SeedImageFromNextendoIfMissing(user_id);
+
         const Common::FS::IOFile image(GetImagePath(user_id), Common::FS::FileAccessMode::Read,
                                        Common::FS::FileType::BinaryFile);
         if (!image.IsOpen()) {
@@ -484,6 +871,8 @@ protected:
         LOG_DEBUG(Service_ACC, "called");
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
+
+        SeedImageFromNextendoIfMissing(user_id);
 
         const Common::FS::IOFile image(GetImagePath(user_id), Common::FS::FileAccessMode::Read,
                                        Common::FS::FileType::BinaryFile);
@@ -665,11 +1054,15 @@ public:
     ~EnsureTokenIdCacheAsyncInterface() = default;
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+        const std::vector<u8> token_bytes = GetIdTokenBytes(system);
+        LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token in async interface ({} bytes)",
+                 token_bytes.size());
+
+        WriteIdToken(ctx, token_bytes);
 
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(0);
+        rb.Push<u32>(static_cast<u32>(token_bytes.size()));
     }
 
 protected:
@@ -682,6 +1075,181 @@ protected:
     Result GetResult() const override {
         return ResultSuccess;
     }
+};
+
+// 6.0.0+
+class IAsyncNetworkServiceLicenseKindContext final
+    : public ServiceFramework<IAsyncNetworkServiceLicenseKindContext> {
+public:
+    explicit IAsyncNetworkServiceLicenseKindContext(Core::System& system_)
+        : ServiceFramework{system_, "IAsyncNetworkServiceLicenseKindContext"},
+          service_context{system_, "IAsyncNetworkServiceLicenseKindContext"} {
+        static const FunctionInfo functions[] = {
+            {0, &IAsyncNetworkServiceLicenseKindContext::GetSystemEvent, "GetSystemEvent"},
+            {1, &IAsyncNetworkServiceLicenseKindContext::Cancel, "Cancel"},
+            {2, &IAsyncNetworkServiceLicenseKindContext::HasDone, "HasDone"},
+            {3, &IAsyncNetworkServiceLicenseKindContext::GetResult, "GetResult"},
+            {100, &IAsyncNetworkServiceLicenseKindContext::GetNetworkServiceLicenseKind, "GetNetworkServiceLicenseKind"},
+        };
+        RegisterHandlers(functions);
+        completion_event = service_context.CreateEvent("IAsyncNetworkServiceLicenseKindContext:CompletionEvent");
+        completion_event->Signal();
+    }
+
+private:
+    void GetSystemEvent(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_ACC, "called");
+        IPC::ResponseBuilder rb{ctx, 2, 1};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(completion_event->GetReadableEvent());
+    }
+
+    void Cancel(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_ACC, "called");
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void HasDone(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_ACC, "called");
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(true);
+    }
+
+    void GetResult(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_ACC, "called");
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetNetworkServiceLicenseKind(HLERequestContext& ctx) {
+        // nn::account::NetworkServiceLicenseKind: 0 NoSubscription, 1 Subscribed.
+        LOG_INFO(Service_ACC, "[Nextendo] GetNetworkServiceLicenseKind -> Subscribed");
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(1);
+    }
+
+    KernelHelpers::ServiceContext service_context;
+    Kernel::KEvent* completion_event;
+};
+
+class AuthorizationRequestAsyncInterface final : public IAsyncContext {
+public:
+    explicit AuthorizationRequestAsyncInterface(Core::System& system_) : IAsyncContext{system_} {
+        MarkComplete();
+    }
+
+protected:
+    bool IsComplete() const override {
+        return true;
+    }
+
+    void Cancel() override {}
+
+    Result GetResult() const override {
+        return ResultSuccess;
+    }
+};
+
+// nn::account::nas::IAuthorizationRequest: Nintendo Account OAuth for a third-party service.
+class INasAuthorizationRequest final : public ServiceFramework<INasAuthorizationRequest> {
+public:
+    static constexpr std::size_t ParametersSize = 0x200;
+    static constexpr std::size_t StateOffset = 0x100;
+    static constexpr std::size_t StateSize = 0x80;
+
+    explicit INasAuthorizationRequest(Core::System& system_, std::span<const u8> parameters,
+                                      u64 parameters_address_)
+        : ServiceFramework{system_, "IAuthorizationRequest"},
+          parameters_address{parameters_address_} {
+        // clang-format off
+        static const FunctionInfo functions[] = {
+            {0, &INasAuthorizationRequest::GetSessionId, "GetSessionId"},
+            {10, &INasAuthorizationRequest::InvokeWithoutInteractionAsync, "InvokeWithoutInteractionAsync"},
+            {19, &INasAuthorizationRequest::IsAuthorized, "IsAuthorized"},
+            {20, &INasAuthorizationRequest::GetAuthorizationCode, "GetAuthorizationCode"},
+            {21, &INasAuthorizationRequest::GetIdToken, "GetIdToken"},
+            {22, &INasAuthorizationRequest::GetState, "GetState"},
+        };
+        // clang-format on
+        RegisterHandlers(functions);
+
+        if (parameters.size() >= StateOffset + StateSize) {
+            std::memcpy(state.data(), parameters.data() + StateOffset, StateSize);
+            const auto scope_end = std::find(parameters.begin(), parameters.begin() + StateOffset, 0);
+            LOG_INFO(Service_ACC, "[Nextendo] Nintendo Account authorization requested, scope='{}'",
+                     std::string(parameters.begin(), scope_end));
+        }
+        std::random_device rd;
+        std::uniform_int_distribution<int> nibble(0, 15);
+        code = "nextendo-";
+        for (int i = 0; i < 32; ++i) {
+            code += "0123456789abcdef"[nibble(rd)];
+        }
+    }
+
+private:
+    void GetSessionId(HLERequestContext& ctx) {
+        IPC::ResponseBuilder rb{ctx, 6};
+        rb.Push(ResultSuccess);
+        rb.PushRaw(session_id);
+    }
+
+    void InvokeWithoutInteractionAsync(HLERequestContext& ctx) {
+        LOG_INFO(Service_ACC, "[Nextendo] Nintendo Account authorization invoked");
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface<AuthorizationRequestAsyncInterface>(system);
+    }
+
+    void IsAuthorized(HLERequestContext& ctx) {
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u8>(1);
+    }
+
+    void WriteString(HLERequestContext& ctx, std::span<const u8> value) {
+        const std::size_t size = std::min(value.size(), ctx.GetWriteBufferSize());
+        LOG_INFO(Service_ACC, "[Nextendo] Nintendo Account authorization: {} of {} bytes returned",
+                 size, value.size());
+        ctx.WriteBuffer(value.data(), size);
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push<u32>(static_cast<u32>(size));
+    }
+
+    void GetAuthorizationCode(HLERequestContext& ctx) {
+        WriteString(ctx, std::span(reinterpret_cast<const u8*>(code.data()), code.size()));
+    }
+
+    void GetIdToken(HLERequestContext& ctx) {
+        const std::vector<u8> token = GetIdTokenBytes(system);
+        LOG_INFO(Service_ACC, "[Nextendo] Providing Nintendo Account id_token ({} bytes)",
+                 token.size());
+        WriteString(ctx, token);
+    }
+
+    void GetState(HLERequestContext& ctx) {
+        // The service echoes the caller's state; read it live in case the caller rewrote it.
+        if (parameters_address != 0) {
+            std::array<u8, StateSize> live{};
+            system.ApplicationMemory().ReadBlock(parameters_address + StateOffset, live.data(),
+                                                 live.size());
+            state = live;
+        }
+        LOG_INFO(Service_ACC, "[Nextendo] Nintendo Account authorization state read");
+        // nn::account::nas::State is returned in a 0x80-byte pointer buffer (type 0x1A), not raw.
+        ctx.WriteBuffer(state);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    std::array<u8, StateSize> state{};
+    std::array<u8, 16> session_id{};
+    std::string code;
+    u64 parameters_address{};
 };
 
 class IManagerForApplication final : public ServiceFramework<IManagerForApplication> {
@@ -700,9 +1268,9 @@ public:
             {4, &IManagerForApplication::LoadIdTokenCache, "LoadIdTokenCache"},
             {130, &IManagerForApplication::GetNintendoAccountUserResourceCacheForApplication, "GetNintendoAccountUserResourceCacheForApplication"},
             {136, &IManagerForApplication::GetNintendoAccountUserResourceCacheForApplication, "GetNintendoAccountUserResourceCache"}, // 19.0.0+
-            {150, nullptr, "CreateAuthorizationRequest"},
+            {150, &IManagerForApplication::CreateAuthorizationRequest, "CreateAuthorizationRequest"},
             {160, &IManagerForApplication::StoreOpenContext, "StoreOpenContext"},
-            {170, nullptr, "LoadNetworkServiceLicenseKindAsync"},
+            {170, &IManagerForApplication::LoadNetworkServiceLicenseKindAsync, "LoadNetworkServiceLicenseKindAsync"},
         };
         // clang-format on
 
@@ -710,26 +1278,103 @@ public:
     }
 
 private:
+    u64 GetEffectivePid() const {
+        const u64 raw_pid = []() -> u64 {
+            if (const u64 linked = Common::NextendoAccount::GetPid(); linked != 0) {
+                return linked;
+            }
+            return ConfiguredTestPid();
+        }();
+
+        if (raw_pid == 0) {
+            return 0xcafe;
+        }
+
+        // [Nextendo] Version gate: refuse to present a real PID for a title whose installed
+        // version isn't exactly the one Nextendo's servers require, reusing the exact same
+        // server-side refusal as "no account linked" (0xcafe is not a real registered
+        // account, so the gated server rejects it) rather than inventing a new failure mode.
+        // Keeps outdated clients off the servers entirely -- reduces load from clients that
+        // can't speak the wire format the server expects, and keeps the playerbase from
+        // fragmenting across versions.
+        const u64 program_id = GetIdTokenProgramId(system);
+        if (Nextendo::CompatibleTitles::Table().contains(program_id)) {
+            const std::string installed_version = GetInstalledTitleVersion(system);
+            if (!Nextendo::CompatibleTitles::IsVersionOk(program_id, installed_version)) {
+                LOG_WARNING(Service_ACC,
+                            "[Nextendo] Refusing online PID: installed version isn't the exact "
+                            "version this title requires for online play");
+                return 0xcafe;
+            }
+        }
+
+        return raw_pid;
+    }
+
+    // True when effective_pid (from GetEffectivePid) is the linked Nextendo account, not the
+    // anonymous or version-gated stub.
+    static bool IsLinkedAccountPid(u64 effective_pid) {
+        return Common::NextendoAccount::IsLinked() && effective_pid != 0 &&
+               effective_pid == Common::NextendoAccount::GetPid();
+    }
+
     void CheckAvailability(HLERequestContext& ctx) {
         LOG_DEBUG(Service_ACC, "(STUBBED) called");
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
+    // [Nextendo] The NSA handed to the running title: in Animal Crossing: New Horizons, the
+    // linked account's baasUserID (that of a real Switch, see nextendo_baas_nsa.h) so a Switch and
+    // the emulator see each other as friends; the pid elsewhere and when it is unknown.
+    u64 AnnouncedAccountId() const {
+        const u64 account_id = GetEffectivePid();
+        const u64 program_id = system.GetApplicationProcessProgramID();
+        if (!IsLinkedAccountPid(account_id) || !TitleUsesBaasNsa(program_id)) {
+            SetBaasNsaMode(false);
+            return account_id;
+        }
+        const u64 announced = ChooseAnnouncedNsa(program_id, account_id, GetLinkedAccountBaasNsa());
+        SetBaasNsaMode(announced != account_id);
+        return announced;
+    }
+
     void GetAccountId(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_ACC, "called");
+        u64 account_id = AnnouncedAccountId();
+        // The PID is accepted as a bare identity by the online service, so never log its value.
+        LOG_DEBUG(Service_ACC, "[Nextendo] Returning the linked account's Network ID");
 
         IPC::ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
-        rb.PushRaw<u64>(profile_manager->GetLastOpenedUser().Hash());
+        rb.PushRaw<u64>(account_id);
     }
 
     void EnsureIdTokenCacheAsync(HLERequestContext& ctx) {
         LOG_WARNING(Service_ACC, "(STUBBED) called");
 
+        // The game is going online and reads the user base (country) right after: start the
+        // account country lookup now, without waiting for it.
+        if (IsLinkedAccountPid(GetEffectivePid())) {
+            PrepareNextendoAccountCountry();
+        }
+
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
         rb.PushIpcInterface(ensure_token_id);
+    }
+
+    void CreateAuthorizationRequest(HLERequestContext& ctx) {
+        // In: u32 transfer-memory size, transfer-memory handle, 0x200-byte parameters buffer.
+        const auto parameters = ctx.ReadBuffer();
+        u64 parameters_address = 0;
+        if (!ctx.BufferDescriptorX().empty()) {
+            parameters_address = ctx.BufferDescriptorX()[0].Address();
+        } else if (!ctx.BufferDescriptorA().empty()) {
+            parameters_address = ctx.BufferDescriptorA()[0].Address();
+        }
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface<INasAuthorizationRequest>(system, parameters, parameters_address);
     }
 
     void LoadIdTokenCacheDeprecated(HLERequestContext& ctx) {
@@ -739,32 +1384,47 @@ private:
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
+        const std::vector<u8> token_bytes = GetIdTokenBytes(system);
+        LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token ({} bytes)", token_bytes.size());
 
-        std::vector<u8> token_data(0x100);
-        std::fill(token_data.begin(), token_data.end(), u8(0));
-
-        ctx.WriteBuffer(token_data);
-
-        IPC::ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.Push(static_cast<u32>(token_data.size()));
-    }
-
-    void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {
-        LOG_WARNING(Service_ACC, "(STUBBED) called");
-
-        std::vector<u8> nas_user_base_for_application(0x68);
-        ctx.WriteBuffer(nas_user_base_for_application);
-
-        if (ctx.CanWriteBuffer(1)) {
-            std::vector<u8> unknown_out_buffer(ctx.GetWriteBufferSize(1));
-            ctx.WriteBuffer(unknown_out_buffer, 1);
-        }
+        WriteIdToken(ctx, token_bytes);
 
         IPC::ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
-        rb.PushRaw<u64>(profile_manager->GetLastOpenedUser().Hash());
+        rb.Push<u32>(static_cast<u32>(token_bytes.size()));
+        rb.Push(0);
+    }
+
+    void GetNintendoAccountUserResourceCacheForApplication(HLERequestContext& ctx) {
+        const u64 account_id = GetEffectivePid();
+        // NasUserBase is the fixed output pointer (C), not the B resource buffer.
+        // SDK GetBirthday reads a NUL-terminated date from offset zero.
+        if (ctx.BufferDescriptorC().empty() ||
+            ctx.BufferDescriptorC()[0].Size() < NextendoCachedAccountInfo.size()) {
+            LOG_ERROR(Service_ACC, "[Nextendo account cache] Missing/short user-base buffer");
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultInvalidArrayLength);
+            return;
+        }
+        // The linked account's country, only when its identity is the one presented to the game.
+        // Empty keeps the field zeroed, as before.
+        const std::string country =
+            IsLinkedAccountPid(account_id) ? GetNextendoAccountCountry() : std::string{};
+        const auto user_base = MakeNextendoCachedAccountInfo(country);
+        ctx.WriteBufferC(user_base.data(), user_base.size(), 0);
+
+        if (!ctx.BufferDescriptorB().empty()) {
+            std::vector<u8> resource(ctx.BufferDescriptorB()[0].Size(), 0);
+            ctx.WriteBufferB(resource.data(), resource.size(), 0);
+        }
+        LOG_INFO(Service_ACC,
+                 "[Nextendo account cache] Returned 0x68-byte user base; shared "
+                 "birthday=2000-01-01; country {}.",
+                 country.size() == 2 ? "set" : "empty");
+
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.PushRaw<u64>(AnnouncedAccountId());
     }
 
     void StoreOpenContext(HLERequestContext& ctx) {
@@ -776,28 +1436,18 @@ private:
         rb.Push(ResultSuccess);
     }
 
+    void LoadNetworkServiceLicenseKindAsync(HLERequestContext& ctx) {
+        LOG_INFO(Service_ACC, "[Nextendo] LoadNetworkServiceLicenseKindAsync called");
+
+        auto async_context = std::make_shared<IAsyncNetworkServiceLicenseKindContext>(system);
+
+        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface(async_context);
+    }
+
     std::shared_ptr<EnsureTokenIdCacheAsyncInterface> ensure_token_id{};
     std::shared_ptr<ProfileManager> profile_manager;
-};
-
-// 6.0.0+
-class IAsyncNetworkServiceLicenseKindContext final
-    : public ServiceFramework<IAsyncNetworkServiceLicenseKindContext> {
-public:
-    explicit IAsyncNetworkServiceLicenseKindContext(Core::System& system_, Common::UUID)
-        : ServiceFramework{system_, "IAsyncNetworkServiceLicenseKindContext"} {
-        // clang-format off
-        static const FunctionInfo functions[] = {
-            {0, nullptr, "GetSystemEvent"},
-            {1, nullptr, "Cancel"},
-            {2, nullptr, "HasDone"},
-            {3, nullptr, "GetResult"},
-            {4, nullptr, "GetNetworkServiceLicenseKind"},
-        };
-        // clang-format on
-
-        RegisterHandlers(functions);
-    }
 };
 
 // 8.0.0+
@@ -877,7 +1527,7 @@ public:
 };
 
 void Module::Interface::GetUserCount(HLERequestContext& ctx) {
-    LOG_DEBUG(Service_ACC, "called");
+    LOG_DEBUG(Service_ACC, "called, user_count={}", profile_manager->GetUserCount());
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
     rb.Push<u32>(static_cast<u32>(profile_manager->GetUserCount()));
@@ -886,15 +1536,16 @@ void Module::Interface::GetUserCount(HLERequestContext& ctx) {
 void Module::Interface::GetUserExistence(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     Common::UUID user_id = rp.PopRaw<Common::UUID>();
-    LOG_DEBUG(Service_ACC, "called user_id=0x{}", user_id.RawString());
+    const bool exists = profile_manager->UserExists(user_id);
+    LOG_DEBUG(Service_ACC, "called user_id=0x{}, exists={}", user_id.RawString(), exists);
 
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
-    rb.Push(profile_manager->UserExists(user_id));
+    rb.Push(exists);
 }
 
 void Module::Interface::ListAllUsers(HLERequestContext& ctx) {
-    LOG_DEBUG(Service_ACC, "called");
+    LOG_DEBUG(Service_ACC, "called, user_count={}", profile_manager->GetUserCount());
     ctx.WriteBuffer(profile_manager->GetAllUsers());
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
@@ -908,7 +1559,7 @@ void Module::Interface::ListOpenUsers(HLERequestContext& ctx) {
 }
 
 void Module::Interface::GetLastOpenedUser(HLERequestContext& ctx) {
-    LOG_DEBUG(Service_ACC, "called");
+    LOG_DEBUG(Service_ACC, "called, uuid=0x{}", profile_manager->GetLastOpenedUser().RawString());
     IPC::ResponseBuilder rb{ctx, 6};
     rb.Push(ResultSuccess);
     rb.PushRaw<Common::UUID>(profile_manager->GetLastOpenedUser());
@@ -985,6 +1636,7 @@ Result Module::Interface::InitializeApplicationInfoBase() {
 
     LOG_WARNING(Service_ACC, "ApplicationInfo init required");
     // TODO(ogniK): Actual initialization here
+    case FileSys::StorageId::NandSystem:
 
     return ResultSuccess;
 }
@@ -1214,11 +1866,13 @@ void Module::Interface::TrySelectUserWithoutInteractionDeprecated(HLERequestCont
 }
 
 void Module::Interface::TrySelectUserWithoutInteraction(HLERequestContext& ctx) {
-    LOG_DEBUG(Service_ACC, "called");
-    // A u8 is passed into this function which we can safely ignore. It's to determine if we have
-    // access to use the network or not by the looks of it
+    IPC::RequestParser rp{ctx};
+    const auto is_network_service_account_required = rp.Pop<bool>();
+    LOG_DEBUG(Service_ACC, "called, is_network_service_account_required={}, user_count={}",
+             is_network_service_account_required, profile_manager->GetUserCount());
     IPC::ResponseBuilder rb{ctx, 6};
     if (profile_manager->GetUserCount() != 1) {
+        LOG_DEBUG(Service_ACC, "-> ResultSuccess w/ InvalidUUID (user_count != 1)");
         rb.Push(ResultSuccess);
         rb.PushRaw(Common::InvalidUUID);
         return;
@@ -1226,12 +1880,14 @@ void Module::Interface::TrySelectUserWithoutInteraction(HLERequestContext& ctx) 
 
     const auto user_list = profile_manager->GetAllUsers();
     if (std::ranges::all_of(user_list, [](const auto& user) { return user.IsInvalid(); })) {
+        LOG_DEBUG(Service_ACC, "-> ResultUnknown (all users invalid)");
         rb.Push(ResultUnknown); // TODO(ogniK): Find the correct error code
         rb.PushRaw(Common::InvalidUUID);
         return;
     }
 
     // Select the first user we have
+    LOG_DEBUG(Service_ACC, "-> ResultSuccess uuid=0x{}", profile_manager->GetUser(0)->RawString());
     rb.Push(ResultSuccess);
     rb.PushRaw(profile_manager->GetUser(0)->uuid);
 }

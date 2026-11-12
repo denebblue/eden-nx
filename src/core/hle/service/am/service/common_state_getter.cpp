@@ -82,6 +82,7 @@ ICommonStateGetter::ICommonStateGetter(Core::System& system_, std::shared_ptr<Ap
         {1000, nullptr, "BeginVrMode3d"}, //19.0.0+
         {1001, nullptr, "EndVrMode3d"}, //19.0.0+
         {1002, nullptr, "IsVrModeEnabled3d"}, //19.0.0+
+        {1031, D<&ICommonStateGetter::TryPopFromFriendInvitationStorageChannel>, "TryPopFromFriendInvitationStorageChannel"}, // Nextendo (as in Citron)
     };
     // clang-format on
 
@@ -202,7 +203,7 @@ Result ICommonStateGetter::GetBootMode(Out<PM::SystemBootMode> out_boot_mode) {
 }
 
 Result ICommonStateGetter::IsVrModeEnabled(Out<bool> out_is_vr_mode_enabled) {
-    LOG_DEBUG(Service_AM, "called");
+    LOG_TRACE(Service_AM, "called");
 
     std::scoped_lock lk{m_applet->lock};
     *out_is_vr_mode_enabled = m_applet->vr_mode_enabled;
@@ -370,6 +371,21 @@ Result ICommonStateGetter::Unknown610() {
 
 Result ICommonStateGetter::Unknown611() {
     LOG_WARNING(Service_AM, "(STUBBED) called");
+    R_SUCCEED();
+}
+
+Result ICommonStateGetter::TryPopFromFriendInvitationStorageChannel(
+    Out<SharedPointer<IStorage>> out_storage) {
+    LOG_DEBUG(Service_AM, "called");
+
+    std::scoped_lock lk{m_applet->lock};
+    auto& channel = m_applet->friend_invitation_storage_channel;
+    R_UNLESS(!channel.empty(), AM::ResultNoDataInChannel);
+    *out_storage = std::make_shared<IStorage>(system, std::move(channel.front()));
+    channel.pop_front();
+    if (channel.empty()) {
+        m_applet->friend_invitation_storage_channel_event.Clear();
+    }
     R_SUCCEED();
 }
 

@@ -46,6 +46,9 @@ public:
 
     void SetAutoCreate(bool state);
 
+    // Locates a title's save directory (same traversal as PerformStartupMirrorSync).
+    VirtualDir GetTitleSaveDirectory(u64 title_id) const;
+
 private:
     Core::System& system;
     ProgramId program_id;

@@ -10,6 +10,7 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -160,7 +161,7 @@ struct Values {
                                          Category::LibraryApplet};
     SwitchableSetting<AppletMode> photo_viewer_applet_mode{
                                                  linkage, AppletMode::LLE, "photo_viewer_applet_mode", Category::LibraryApplet};
-    SwitchableSetting<AppletMode> offline_web_applet_mode{linkage, AppletMode::LLE, "offline_web_applet_mode",
+    SwitchableSetting<AppletMode> offline_web_applet_mode{linkage, AppletMode::HLE, "offline_web_applet_mode",
                                                 Category::LibraryApplet};
     Setting<AppletMode> login_share_applet_mode{linkage, AppletMode::HLE, "login_share_applet_mode",
                                                 Category::LibraryApplet};
@@ -831,6 +832,17 @@ struct Values {
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
                                            Category::Network};
     SwitchableSetting<bool> airplane_mode{linkage, false, "airplane_mode", Category::Network};
+    Setting<bool> enable_nextendo{linkage, false, "enable_nextendo", Category::Network};
+    Setting<std::string> nextendo_server_ip{linkage, "51.178.29.194", "nextendo_server_ip",
+                                            Category::Network};
+    Setting<std::string> nextendo_nat_ip{linkage, "164.132.111.120", "nextendo_nat_ip",
+                                         Category::Network};
+    Setting<std::string> nextendo_pid{linkage, "", "nextendo_pid", Category::Network};
+    // Governs the automatic pull-on-boot/push-on-stop cloud save sync only -- the manual
+    // "Download Save" button in the Nextendo Account dialog is an explicit per-click action
+    // and isn't gated by this, since that's already opt-in every time.
+    Setting<bool> nextendo_cloud_sync_enabled{linkage, true, "nextendo_cloud_sync_enabled",
+                                              Category::Network};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
@@ -842,6 +854,9 @@ struct Values {
 
     // Add-Ons
     std::map<u64, std::vector<std::string>> disabled_addons;
+    // title_ids where DLC should list as individual rows instead of one grouped toggle. Absent
+    // means grouped (the default).
+    std::set<u64> dlc_list_separately;
 
     // Per-game overrides
     bool use_squashed_iterated_blend;

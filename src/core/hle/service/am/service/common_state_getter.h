@@ -61,6 +61,7 @@ private:
                                     OutArray<AppletId, BufferAttr_HipcMapAlias> out_applet_ids);
     Result GetSettingsPlatformRegion(Out<Set::PlatformRegion> out_settings_platform_region);
     Result SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled();
+    Result TryPopFromFriendInvitationStorageChannel(Out<SharedPointer<IStorage>> out_storage);
     Result PushToGeneralChannel(SharedPointer<IStorage> storage); // cmd 20
     Result SetHandlingHomeButtonShortPressedEnabled(bool enabled);
     Result Unknown610();

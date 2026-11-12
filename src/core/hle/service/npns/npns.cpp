@@ -36,12 +36,12 @@ public:
             {14, nullptr, "SubscribeTopicByAccount"}, // 18.0.0+
             {15, nullptr, "UnsubscribeTopicByAccount"}, // 18.0.0+
             {16, nullptr, "DownloadSubscriptionList"}, // 18.0.0+
-            {21, nullptr, "CreateToken"},
+            {21, C<&INpnsSystem::CreateToken>, "CreateToken"},
             {22, nullptr, "CreateTokenWithApplicationId"},
             {23, nullptr, "DestroyToken"},
             {24, nullptr, "DestroyTokenWithApplicationId"},
             {25, nullptr, "QueryIsTokenValid"},
-            {26, nullptr, "ListenToMyApplicationId"},
+            {26, C<&INpnsSystem::ListenToMyApplicationId>, "ListenToMyApplicationId"},
             {27, nullptr, "DestroyTokenAll"},
             {28, nullptr, "CreateTokenWithName"}, // 18.0.0+
             {29, nullptr, "DestroyTokenWithName"}, // 18.0.0+
@@ -79,9 +79,9 @@ public:
             {155, nullptr, "CreateTokenAsyncWithApplicationId"},
             {156, nullptr, "CreateTokenWithNameAsync"}, // 18.0.0+
             {161, C<&INpnsSystem::GetRequestChangeStateCancelEvent>, "GetRequestChangeStateCancelEvent"}, // 10.0.0+
-            {162, nullptr, "RequestChangeStateForceTimedWithCancelEvent"},
-            {201, nullptr, "RequestChangeStateForceTimed"},
-            {202, nullptr, "RequestChangeStateForceAsync"},
+            {162, C<&INpnsSystem::RequestChangeStateForceTimedWithCancelEvent>, "RequestChangeStateForceTimedWithCancelEvent"},
+            {201, C<&INpnsSystem::RequestChangeStateForceTimed>, "RequestChangeStateForceTimed"},
+            {202, C<&INpnsSystem::RequestChangeStateForceAsync>, "RequestChangeStateForceAsync"},
             {301, nullptr, "GetPassword"}, // 18.0.0+
             {302, nullptr, "GetAllImmigration"}, // 18.0.0+
             {303, nullptr, "GetNotificationHistories"}, // 18.0.0+
@@ -140,6 +140,37 @@ private:
         R_SUCCEED();
     }
 
+    // [Nextendo] These three were nullptr, which throws a guest-visible fatal (2010-0212) rather
+    // than a normal IPC error -- QLaunch's "Update" button on the Friends viewer calls this
+    // family to force an immediate push-service state refresh, so pressing it threw an error
+    // dialog every time. There is no real push-notification backend behind this yet, so this
+    // is a plain success stub, not a full implementation -- it just stops the crash rather than
+    // driving a real state change.
+    Result RequestChangeStateForceTimedWithCancelEvent() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result RequestChangeStateForceTimed() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result RequestChangeStateForceAsync() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result ListenToMyApplicationId() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result CreateToken() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
     KernelHelpers::ServiceContext service_context;
     Event get_receive_event;
     Event get_request_change_state_cancel_event;
@@ -158,10 +189,10 @@ public:
             {5, C<&INpnsUser::GetReceiveEvent>, "GetReceiveEvent"},
             {7, nullptr, "GetStateChangeEvent"},
             {8, C<&INpnsUser::ListenToByName>, "ListenToByName"}, // 18.0.0+
-            {21, nullptr, "CreateToken"},
+            {21, C<&INpnsUser::CreateToken>, "CreateToken"},
             {23, nullptr, "DestroyToken"},
             {25, nullptr, "QueryIsTokenValid"},
-            {26, nullptr, "ListenToMyApplicationId"},
+            {26, C<&INpnsUser::ListenToMyApplicationId>, "ListenToMyApplicationId"},
             {101, nullptr, "Suspend"},
             {102, nullptr, "Resume"},
             {103, nullptr, "GetState"},
@@ -192,6 +223,16 @@ private:
         LOG_DEBUG(Service_NPNS, "called");
 
         *out_event = get_receive_event.GetHandle();
+        R_SUCCEED();
+    }
+
+    Result ListenToMyApplicationId() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result CreateToken() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
         R_SUCCEED();
     }
 

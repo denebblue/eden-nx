@@ -7,6 +7,21 @@
 add_library(web_service STATIC
     announce_room_json.cpp
     announce_room_json.h
+    game_catalog.cpp
+    game_catalog.h
+    game_catalog_manifest.cpp
+    game_catalog_manifest.h
+    nextendo_api.cpp
+    nextendo_api.h
+    npln_patch_catalog.cpp
+    npln_patch_catalog.h
+    npln_patch_manifest.cpp
+    npln_patch_manifest.h
+    npln_patch_state.h
+    population_scraper_client.cpp
+    population_scraper_client.h
+    ssbu_mod_installer.cpp
+    ssbu_mod_installer.h
     verify_login.cpp
     verify_login.h
     verify_user_jwt.cpp

@@ -1,0 +1,89 @@
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <map>
+#include <set>
+#include <string>
+#include <QObject>
+#include <QString>
+#include <QTimer>
+
+#include "common/common_types.h"
+
+namespace Core {
+class System;
+}
+
+namespace Common {
+struct UUID;
+}
+
+class NextendoGameInvites;
+
+// Sign-in/out, friend-cache refresh, profile name/avatar sync and the friend poll.
+// One instance, owned by MainWindow.
+class NextendoController : public QObject {
+    Q_OBJECT
+
+public:
+    explicit NextendoController(Core::System& system, QObject* parent = nullptr);
+    ~NextendoController() override;
+
+    bool IsLinked() const;
+
+    // Title id -> display name via the locally installed game's NACP. Falls back to hint_name,
+    // then to a generic "a game".
+    QString ResolveGameName(const std::string& app_id_hex, const std::string& hint_name = {}) const;
+
+    // Title id -> base64 icon via the locally installed game's NACP; empty if not installed.
+    QString ResolveGameIcon(const std::string& app_id_hex) const;
+
+    // 16 hex digits of the locally running title, matching Friend::app_id; empty if not running.
+    std::string GetLocalAppId() const;
+
+    void SignIn();
+    void SignOut();
+    void RefreshFriendCache();
+    void NotifyFriendRequestSent(const QString& friend_code);
+
+    void ManualSaveDownload(u64 title_id);
+    void QuickStart(u64 title_id);
+
+    NextendoGameInvites* GameInvites() const {
+        return game_invites;
+    }
+
+signals:
+    void AccountLinked();
+    void AccountUnlinked();
+    void FriendCameOnline(u64 pid, QString name, QString game_name, QString avatar_base64);
+    void FriendWentOffline(u64 pid, QString name, QString avatar_base64);
+    void FriendRequestReceived(u64 pid, QString name, QString avatar_base64);
+    void FriendRequestSent(QString friend_code);
+    void StatusChanged(QString message);
+    void QuickStartRequested(u64 title_id);
+    // Fired once the OAuth URL is known, whether or not the OS actually opened a browser.
+    void SignInUrlReady(QString url);
+    void SignInFinished();
+
+private:
+    void ApplyProfileName(const std::string& name);
+    // Re-reads the account's display name from the server and renames the active profile.
+    void SyncProfileName();
+    // Forces the active Switch profile's picture to match the linked account's avatar.
+    void SyncProfileAvatar();
+    void WriteProfileAvatar(const Common::UUID& uuid, const std::string& avatar_b64);
+    void PollFriends();
+
+    Core::System& system;
+    QTimer friend_poll_timer;
+    QTimer profile_name_timer;
+    std::map<u64, s32> last_known_status;
+    std::map<u64, int> offline_streak; // consecutive polls seen offline, not yet confirmed
+    std::set<u64> last_known_requests;
+    bool first_poll = true; // suppresses a notification burst for every friend online at boot
+
+    NextendoGameInvites* game_invites = nullptr;
+};

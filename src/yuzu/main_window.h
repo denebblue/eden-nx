@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 
 #include <filesystem>
 #include <QMainWindow>
@@ -59,6 +60,11 @@ class PerformanceOverlay;
 enum class GameListOpenTarget;
 enum class DumpRomFSTarget;
 class GameListPlaceholder;
+class NextendoAccountDialog;
+class NextendoController;
+class NextendoToast;
+class QDialog;
+class QMenu;
 
 class QtAmiiboSettingsDialog;
 class QtControllerSelectorDialog;
@@ -177,6 +183,13 @@ public:
     void AcceptDropEvent(QDropEvent* event);
 
     std::filesystem::path GetShortcutPath(QtCommon::Game::ShortcutTarget target);
+
+    // [Nextendo] Online schedule / BCAT delivery packages (nextendo/nextendo_main_window.cpp).
+    void OfferNextendoByamlDownload(u64 title_id);
+    void NextendoByamlDownloadFromMenu(u64 title_id);
+    bool NextendoByamlRequired(u64 title_id) const;
+    bool NextendoByamlInstalled(u64 title_id) const;
+    bool NextendoByamlSkipped(u64 title_id) const;
 
 signals:
 
@@ -600,6 +613,48 @@ private:
                         std::string arguments, const bool needs_title);
 
     void InstallFirmware(const QString& location, bool recursive = false);
+
+    // [Nextendo] Hooks implemented in nextendo/nextendo_main_window.cpp.
+    void NextendoInitialize();
+    void NextendoConnectMenu();
+    void NextendoOpenAccountPage(int page);
+    QString NextendoGamePath(u64 title_id) const;
+    void NextendoPrepareOnlinePatches(const QString& filename,
+                                      const Service::AM::FrontendAppletParameters& params);
+    void NextendoLoadFailed();
+    bool NextendoBeforeBoot(u64 title_id);
+    void NextendoApplyPerGameWorkarounds(u64 title_id);
+    void NextendoOnGameBooted(const std::string& title_name);
+    void NextendoOnStartGame();
+    void NextendoOnEmulationStopped();
+    void NextendoOnClose();
+    void NextendoAfterShutdownOnClose();
+    void SyncNextendoHistory();
+    void NextendoByamlMarkSkipped(u64 title_id) const;
+    bool NextendoByamlDownload(u64 title_id);
+    void RunNextendoByamlDownloadWithProgress(u64 title_id);
+    void SilentlyDownloadNextendoByaml(u64 title_id);
+
+    NextendoController* nextendo_controller = nullptr;
+    NextendoToast* nextendo_toast = nullptr;
+    QDialog* nextendo_signin_dialog = nullptr;
+    NextendoAccountDialog* nextendo_account_dialog_instance = nullptr;
+    QMenu* nextendo_menu = nullptr;
+    QAction* nextendo_action_open_account = nullptr;
+    QAction* nextendo_action_sign_in = nullptr;
+    QAction* nextendo_action_sign_out = nullptr;
+    QAction* nextendo_action_redirection = nullptr;
+    QAction* nextendo_action_cloud_sync = nullptr;
+    QAction* nextendo_action_notifications = nullptr;
+    QTimer nextendo_presence_timer;
+    std::string nextendo_last_pushed_app_id;
+    // Title being booted/run (set before LoadROM), and the program id play time is counted for.
+    u64 nextendo_title_id = 0;
+    u64 nextendo_playtime_program_id = 0;
+    std::string nextendo_game_name;
+    std::string nextendo_game_icon_base64;
+    bool nextendo_bcat_autodownload_done = false;
+    bool nextendo_main_window_closing = false;
 
 protected:
     void dropEvent(QDropEvent* event) override;

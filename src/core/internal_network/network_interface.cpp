@@ -223,19 +223,28 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
 std::optional<Network::NetworkInterface> GetSelectedNetworkInterface() {
     auto const& sel_if = Settings::values.network_interface.GetValue();
     if (auto const ifaces = Network::GetAvailableNetworkInterfaces(); ifaces.size() > 0) {
-        if (sel_if.empty())
-            return ifaces[0];
-        if (auto const res = std::ranges::find_if(ifaces, [&sel_if](const auto& iface) {
-            return iface.name == sel_if;
-        }); res != ifaces.end())
-            return *res;
-        // Only print the error once to avoid log spam
+        if (!sel_if.empty()) {
+            if (auto const res = std::ranges::find_if(ifaces, [&sel_if](const auto& iface) {
+                return iface.name == sel_if;
+            }); res != ifaces.end())
+                return *res;
+        }
+        // [Nextendo] Not set or not found: prefer an adapter with a gateway; a VPN tunnel often
+        // sorts first but peers can't reach it.
+        const auto with_gateway = std::ranges::find_if(ifaces, [](const auto& iface) {
+            return iface.gateway.s_addr != 0;
+        });
+        const auto& chosen = with_gateway != ifaces.end() ? *with_gateway : ifaces.front();
+        // Only print once to avoid log spam
         static bool print_error = true;
         if (print_error) {
-            LOG_WARNING(Network, "Couldn't find interface \"{}\"", sel_if);
+            LOG_INFO(Network,
+                     "Selected interface \"{}\" not explicitly set or found; using primary "
+                     "interface \"{}\"",
+                     sel_if, chosen.name);
             print_error = false;
         }
-        return std::nullopt;
+        return chosen;
     }
     LOG_WARNING(Network, "No interfaces");
     return std::nullopt;

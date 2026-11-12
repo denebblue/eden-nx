@@ -196,7 +196,9 @@ Result ILibraryAppletCreator::CreateLibraryApplet(
               library_applet_mode);
 
     std::shared_ptr<ILibraryAppletAccessor> library_applet;
-    if (ShouldCreateGuestApplet(applet_id)) {
+    if (ShouldCreateGuestApplet(applet_id) &&
+        !(applet_id == AppletId::MyPage &&
+          system.GetFrontendAppletHolder().GetFrontendAppletSet().friend_invitation)) {
         library_applet =
             CreateGuestApplet(system, m_window_system, m_applet, applet_id, library_applet_mode);
     }
@@ -222,7 +224,9 @@ Result ILibraryAppletCreator::CreateLibraryAppletEx(
               library_applet_mode, thread_id);
 
     std::shared_ptr<ILibraryAppletAccessor> library_applet;
-    if (ShouldCreateGuestApplet(applet_id)) {
+    if (ShouldCreateGuestApplet(applet_id) &&
+        !(applet_id == AppletId::MyPage &&
+          system.GetFrontendAppletHolder().GetFrontendAppletSet().friend_invitation)) {
         library_applet =
             CreateGuestApplet(system, m_window_system, m_applet, applet_id, library_applet_mode);
     }

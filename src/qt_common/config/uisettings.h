@@ -159,6 +159,10 @@ struct Values {
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, false, "enable_discord_presence", Category::Ui};
 
+    // Nextendo Network: friend online/offline/request notifications (game invites always show).
+    Setting<bool> nextendo_notifications_enabled{linkage, true, "nextendo_notifications_enabled",
+                                                 Category::Ui};
+
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};
 

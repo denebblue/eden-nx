@@ -249,19 +249,23 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
             continue;
         }
 
+        LOG_INFO(Loader, "  (2nd pass) loading module '{}'", module);
         const VAddr load_addr{next_load_addr};
         const bool should_pass_arguments = std::strcmp(module, "rtld") == 0;
         const auto tentative_next_load_addr = AppLoader_NSO::LoadModule(
             process, system, *module_file, load_addr, should_pass_arguments, true, pm,
             patch_ctx.GetPatchers(), patch_ctx.GetIndex(i));
         if (!tentative_next_load_addr) {
+            LOG_ERROR(Loader, "  (2nd pass) failed to load module '{}'", module);
             return {ResultStatus::ErrorLoadingNSO, {}};
         }
 
         next_load_addr = *tentative_next_load_addr;
         modules.insert_or_assign(load_addr, module);
-        LOG_DEBUG(Loader, "loaded module {} @ {:#X}", module, load_addr);
+        LOG_INFO(Loader, "  (2nd pass) loaded module {} @ {:#X}", module, load_addr);
     }
+    LOG_INFO(Loader, "Second pass complete, returning LoadParameters priority={} stack_size={:#x}",
+             metadata.GetMainThreadPriority(), metadata.GetMainThreadStackSize());
 
     is_loaded = true;
     return {ResultStatus::Success,
@@ -311,6 +315,32 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadNSOModules(Modules& out_mo
 
     out_modules = this->modules;
     return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_DeconstructedRomDirectory::ReadMainBuildId(
+    Core::System& system, std::array<u8, 0x20>& build_id) {
+    auto exefs = dir ? dir : (file ? file->GetContainingDirectory() : nullptr);
+    if (!exefs) {
+        return ResultStatus::ErrorNoExeFS;
+    }
+    if (override_update) {
+        auto program_id = title_id;
+        if (const auto npdm = exefs->GetFile("main.npdm")) {
+            FileSys::ProgramMetadata program;
+            if (program.Load(npdm) == ResultStatus::Success) {
+                program_id = program.GetTitleID();
+            }
+        }
+        const FileSys::PatchManager manager(program_id, system.GetFileSystemController(),
+                                            system.GetContentProvider());
+        exefs = manager.PatchExeFS(exefs);
+    }
+    const auto main = exefs ? exefs->GetFile("main") : nullptr;
+    if (!main) {
+        return ResultStatus::ErrorNoExeFS;
+    }
+    AppLoader_NSO loader(main);
+    return loader.ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader
