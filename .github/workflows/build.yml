@@ -107,3 +107,6 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: false
+          # Tags like v1.2.0-beta1 are test builds: GitHub keeps them out of releases/latest,
+          # so the self-updater does not offer them to everyone.
+          prerelease: ${{ contains(github.ref_name, '-') }}

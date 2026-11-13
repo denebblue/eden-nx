@@ -229,9 +229,10 @@ void Maxwell3D::ProcessMacro(u32 method, const u32* base_start, u32 amount, bool
 }
 
 void Maxwell3D::RefreshParametersImpl() {
-    if (!Settings::IsGPULevelHigh()) {
-        return;
-    }
+    // Only reached when the macro's parameters are GPU-modified (RefreshParameters checks
+    // current_macro_dirty). Below Accurate these used to be skipped, so HLE macros that consume
+    // them on the CPU (indirect draws built by GPU culling) ran with the previous frame's values.
+    // From upstream PR #4605.
     size_t current_index = 0;
     for (auto& segment : macro_segments) {
         if (segment.first == 0) {

@@ -226,6 +226,8 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    // Set after a compute dispatch; the next draw orders its writes before graphics reads.
+    bool compute_writes_need_graphics_barrier = false;
 };
 
 } // namespace Vulkan
