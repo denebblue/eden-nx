@@ -20,8 +20,8 @@ add_library(web_service STATIC
     npln_patch_state.h
     population_scraper_client.cpp
     population_scraper_client.h
-    ssbu_mod_installer.cpp
-    ssbu_mod_installer.h
+    github_releases.cpp
+    github_releases.h
     verify_login.cpp
     verify_login.h
     verify_user_jwt.cpp

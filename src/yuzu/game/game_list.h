@@ -127,6 +127,8 @@ signals:
     void LinkToRyujinxRequested(const u64& program_id);
     // [Nextendo] Download/refresh the online schedule or BCAT package of this title.
     void DownloadNextendoScheduleRequested(u64 program_id);
+    // [Nextendo] Install/update the SSBU online mod stack.
+    void InstallSsbuModsRequested(u64 program_id);
     void OpenDirectory(const QString& directory);
     void AddDirectory();
     void ShowList(bool show);

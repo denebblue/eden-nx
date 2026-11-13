@@ -61,6 +61,8 @@
 #include "yuzu/nextendo/nextendo_package_bcat.h"
 #include "yuzu/nextendo/nextendo_save_sync.h"
 #include "yuzu/nextendo/nextendo_splatoon3_bcat.h"
+#include "yuzu/nextendo/nextendo_ssbu_mods.h"
+#include "yuzu/nextendo/nextendo_updater.h"
 #include "yuzu/nextendo/nextendo_toast.h"
 #include "yuzu/nextendo/nextendo_zip.h"
 
@@ -146,6 +148,9 @@ void MainWindow::NextendoInitialize() {
     // [Nextendo] Island uploads left pending (emulator closed during or before the upload).
     Service::OLSC::NextendoIsland::RunPendingInBackground();
     nextendo_toast = new NextendoToast(this);
+    nextendo_updater = new NextendoUpdater(this);
+    connect(nextendo_updater, &NextendoUpdater::QuitForUpdate, this, [this] { close(); });
+    nextendo_updater->CheckInBackground();
 
     // Splatoon 2's schedule: the content provider isn't populated yet at this point of boot, so
     // just attempt the 3 known title IDs; a decline ("Don't ask again") makes this a no-op.
@@ -172,6 +177,9 @@ void MainWindow::NextendoConnectMenu() {
     nextendo_action_cloud_sync->setCheckable(true);
     nextendo_action_notifications = nextendo_menu->addAction(tr("Show Friend &Notifications"));
     nextendo_action_notifications->setCheckable(true);
+    nextendo_menu->addSeparator();
+    connect(nextendo_menu->addAction(tr("Check for &Updates...")), &QAction::triggered, this,
+            [this] { nextendo_updater->CheckInteractive(); });
 
     const auto refresh_link_state = [this] {
         const bool linked = Common::NextendoAccount::IsLinked();
@@ -407,6 +415,8 @@ void MainWindow::NextendoConnectMenu() {
     });
     connect(game_list, &GameList::DownloadNextendoScheduleRequested, this,
             &MainWindow::NextendoByamlDownloadFromMenu);
+    connect(game_list, &GameList::InstallSsbuModsRequested, this,
+            &MainWindow::NextendoInstallSsbuMods);
 }
 
 void MainWindow::NextendoOpenAccountPage(int page) {
@@ -537,6 +547,17 @@ void MainWindow::NextendoApplyPerGameWorkarounds(u64 title_id) {
     if (IsSplatoon2(title_id) || title_id == kSplatoon3) {
         LOG_INFO(Frontend, "[Nextendo] Clamping resolution to 1x for Splatoon (online points)");
         Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
+    }
+    // Skyline/ozone patches SSBU at fixed offsets and breaks under Eden's randomized load
+    // address (ARCropolis then reports a wrong game version or the game crashes at boot). A
+    // fixed RNG seed pins the address; this is the documented Eden workaround (seed 0). Set as
+    // a per-game override so it is dropped again when the game closes.
+    if (title_id == Nextendo::SsbuMods::TitleId && Nextendo::SsbuMods::IsLoaderInstalled()) {
+        LOG_INFO(Frontend, "[Nextendo] SSBU mod loader present: pinning RNG seed to 0");
+        Settings::values.rng_seed_enabled.SetGlobal(false);
+        Settings::values.rng_seed_enabled.SetValue(true);
+        Settings::values.rng_seed.SetGlobal(false);
+        Settings::values.rng_seed.SetValue(0);
     }
 }
 
@@ -785,6 +806,98 @@ void MainWindow::NextendoByamlDownloadFromMenu(u64 title_id) {
         return;
     }
     RunNextendoByamlDownloadWithProgress(title_id);
+}
+
+void MainWindow::NextendoInstallSsbuMods(u64 title_id) {
+#ifdef ENABLE_WEB_SERVICE
+    if (title_id != Nextendo::SsbuMods::TitleId) {
+        return;
+    }
+    if (QtCommon::system->IsPoweredOn()) {
+        QMessageBox::information(this, tr("SSBU Online Mods"),
+                                 tr("Close the running game before installing the mods."));
+        return;
+    }
+
+    // The plugins hook fixed offsets of one game version; refuse anything older.
+    const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
+                                   QtCommon::system->GetContentProvider()};
+    const auto nacp = pm.GetControlMetadata().first;
+    const std::string version = nacp ? nacp->GetVersionString() : std::string{};
+    if (!Nextendo::SsbuMods::IsSupportedVersion(version)) {
+        QMessageBox::warning(
+            this, tr("SSBU Online Mods"),
+            tr("These mods need Super Smash Bros. Ultimate %1 or newer, but the installed "
+               "version is %2.
+
+Install the %1 update (File > Install Files to NAND, or add "
+               "its folder to the game list) and try again.")
+                .arg(QString::fromLatin1(Nextendo::SsbuMods::RequiredVersion),
+                     version.empty() ? tr("unknown (no update installed)")
+                                     : QString::fromStdString(version)));
+        return;
+    }
+
+    if (QMessageBox::question(
+            this, tr("SSBU Online Mods"),
+            tr("This downloads the latest SSBU Online Deluxe mod set (ozone, ARCropolis, "
+               "Smashline, nro-hook, imgui-smash, PIA manager, ssbusync and Online Deluxe) and "
+               "installs it on the emulated SD card.
+
+The current loader and plugins are "
+               "backed up first, and nothing is changed if any download fails. Continue?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+
+    QProgressDialog progress(tr("Downloading and installing SSBU mods..."), QString{}, 0, 0,
+                             this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.show();
+    auto future = QtConcurrent::run([] { return Nextendo::SsbuMods::Install(); });
+    while (!future.isFinished()) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    progress.close();
+    const auto report = future.result();
+
+    const auto list = [](const std::vector<std::string>& items) {
+        QString html;
+        for (const auto& item : items) {
+            html += QStringLiteral("<br>&bull; %1").arg(QString::fromStdString(item).toHtmlEscaped());
+        }
+        return html;
+    };
+    QString text;
+    if (report.success) {
+        text = tr("Mods installed:") + list(report.installed);
+        if (!report.removed_conflicts.empty()) {
+            text += QStringLiteral("<br><br>") + tr("Removed conflicting plugins:") +
+                    list(report.removed_conflicts);
+        }
+        if (!report.warnings.empty()) {
+            text += QStringLiteral("<br><br>") + tr("Warnings:") + list(report.warnings);
+        }
+        text += QStringLiteral("<br><br>") +
+                tr("The RNG seed workaround these mods need on Eden is applied automatically "
+                   "when the game starts.");
+    } else {
+        text = tr("The mods were not installed and nothing was changed:") + list(report.errors);
+    }
+    if (!report.backup_dir.empty()) {
+        text += QStringLiteral("<br><br>") + tr("Previous files backed up to:") +
+                QStringLiteral("<br>%1").arg(
+                    QString::fromStdString(report.backup_dir.string()).toHtmlEscaped());
+    }
+    QMessageBox box(report.success ? QMessageBox::Information : QMessageBox::Warning,
+                    tr("SSBU Online Mods"), text, QMessageBox::Ok, this);
+    box.setTextFormat(Qt::RichText);
+    box.exec();
+#else
+    (void)title_id;
+#endif
 }
 
 void MainWindow::SilentlyDownloadNextendoByaml(u64 title_id) {

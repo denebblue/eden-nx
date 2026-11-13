@@ -58,6 +58,7 @@ jobs:
           $env:VULKAN_SDK = (Get-ChildItem C:/VulkanSDK | Select-Object -First 1).FullName
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            "-DNX_VERSION=$(if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev-${{ github.sha }}'.Substring(0, 14) })" `
             "-DCMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /Z7" `
             "-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /Z7" `
             -DYUZU_TESTS=OFF `
@@ -73,6 +74,13 @@ jobs:
           New-Item -ItemType Directory -Force dist-win | Out-Null
           Copy-Item build/bin/* dist-win -Recurse -Exclude *.pdb,*.ilk,*.lib,*.exp
           New-Item -ItemType Directory -Force dist-win/user | Out-Null  # modo portable
+          # File list of this version, used by the self-updater to remove it cleanly later.
+          Push-Location dist-win
+          Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '[\\/]user[\\/]' } |
+            ForEach-Object { (Resolve-Path -Relative $_.FullName).Substring(2) } |
+            Set-Content -Encoding utf8 nx-manifest.txt
+          Add-Content -Encoding utf8 nx-manifest.txt 'nx-manifest.txt'
+          Pop-Location
           Compress-Archive -Path dist-win/* -DestinationPath eden-nextendo-windows-x64.zip
           # Debug symbols, shipped separately so crash offsets can be resolved
           New-Item -ItemType Directory -Force dist-pdb | Out-Null

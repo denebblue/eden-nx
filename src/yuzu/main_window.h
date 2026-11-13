@@ -63,6 +63,7 @@ class GameListPlaceholder;
 class NextendoAccountDialog;
 class NextendoController;
 class NextendoToast;
+class NextendoUpdater;
 class QDialog;
 class QMenu;
 
@@ -187,6 +188,7 @@ public:
     // [Nextendo] Online schedule / BCAT delivery packages (nextendo/nextendo_main_window.cpp).
     void OfferNextendoByamlDownload(u64 title_id);
     void NextendoByamlDownloadFromMenu(u64 title_id);
+    void NextendoInstallSsbuMods(u64 title_id);
     bool NextendoByamlRequired(u64 title_id) const;
     bool NextendoByamlInstalled(u64 title_id) const;
     bool NextendoByamlSkipped(u64 title_id) const;
@@ -637,6 +639,7 @@ private:
 
     NextendoController* nextendo_controller = nullptr;
     NextendoToast* nextendo_toast = nullptr;
+    NextendoUpdater* nextendo_updater = nullptr;
     QDialog* nextendo_signin_dialog = nullptr;
     NextendoAccountDialog* nextendo_account_dialog_instance = nullptr;
     QMenu* nextendo_menu = nullptr;

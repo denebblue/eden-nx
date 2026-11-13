@@ -730,6 +730,10 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     if (Nextendo::BcatTitles::IsBcatTitle(program_id)) {
         download_online_schedule = context_menu.addAction(tr("Download Nextendo Online Data"));
     }
+    QAction* install_ssbu_mods = nullptr;
+    if (program_id == 0x01006A800016E000ULL) {
+        install_ssbu_mods = context_menu.addAction(tr("Install/Update SSBU Online Mods"));
+    }
     context_menu.addSeparator();
     QMenu* remove_menu = context_menu.addMenu(tr("Remove"));
     QAction* remove_update = remove_menu->addAction(tr("Remove Installed Update"));
@@ -854,6 +858,10 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     if (download_online_schedule) {
         connect(download_online_schedule, &QAction::triggered, this,
                 [this, program_id]() { emit DownloadNextendoScheduleRequested(program_id); });
+    }
+    if (install_ssbu_mods) {
+        connect(install_ssbu_mods, &QAction::triggered, this,
+                [this, program_id]() { emit InstallSsbuModsRequested(program_id); });
     }
 };
 
