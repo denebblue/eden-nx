@@ -33,6 +33,8 @@ struct DynamicFeatures {
     bool has_dynamic_state3_logic_op_enable;
     bool has_dynamic_state3_line_stipple_enable;
     bool has_dynamic_vertex_input;
+    // AMD misreads vertex streams whose stride is not a multiple of 4 (Splatoon 3).
+    bool needs_vertex_stride_alignment;
     bool has_provoking_vertex;
     bool has_provoking_vertex_first_mode;
     bool has_provoking_vertex_last_mode;

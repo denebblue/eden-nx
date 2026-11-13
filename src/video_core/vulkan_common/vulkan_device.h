@@ -289,6 +289,11 @@ public:
         return properties.properties.driverVersion;
     }
 
+    /// Returns the PCI vendor ID (0x1002 = AMD, 0x10DE = NVIDIA, 0x8086 = Intel).
+    u32 GetVendorID() const {
+        return properties.properties.vendorID;
+    }
+
     /// Returns the device name.
     std::string_view GetModelName() const {
         return properties.properties.deviceName;

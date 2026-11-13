@@ -546,6 +546,9 @@ void MainWindow::NextendoApplyPerGameWorkarounds(u64 title_id) {
     // points in Splatoon 2 and 3. Clamp to 1x until the scaling bug is fixed.
     if (IsSplatoon2(title_id) || title_id == kSplatoon3) {
         LOG_INFO(Frontend, "[Nextendo] Clamping resolution to 1x for Splatoon (online points)");
+        // Per-game override: SetValue on a setting still using the global value would rewrite
+        // the global resolution (saved on exit) for every other game.
+        Settings::values.resolution_setup.SetGlobal(false);
         Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
     }
     // Skyline/ozone patches SSBU at fixed offsets and breaks under Eden's randomized load
