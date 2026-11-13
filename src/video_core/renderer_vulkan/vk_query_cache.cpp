@@ -41,8 +41,8 @@ class SamplesQueryBank : public VideoCommon::BankBase {
 public:
     static constexpr size_t BANK_SIZE = 256;
     static constexpr size_t QUERY_SIZE = 8;
-    explicit SamplesQueryBank(const Device& device_, size_t index_)
-        : BankBase(BANK_SIZE), device{device_}, index{index_} {
+    explicit SamplesQueryBank(const Device& device_, Scheduler& scheduler_, size_t index_)
+        : BankBase(BANK_SIZE), device{device_}, scheduler{scheduler_}, index{index_} {
         const auto& dev = device.GetLogical();
         query_pool = dev.CreateQueryPool({
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -60,10 +60,21 @@ public:
     void Reset() override {
         ASSERT(references == 0);
         VideoCommon::BankBase::Reset();
+        // Host reset (Vulkan 1.2 hostQueryReset). IsDead() guarantees the GPU finished with
+        // this bank before it is reused.
         const auto& dev = device.GetLogical();
         dev.ResetQueryPool(*query_pool, 0, BANK_SIZE);
         host_results.fill(0ULL);
         next_bank = 0;
+    }
+
+    void AddReference(size_t how_many = 1) {
+        BankBase::AddReference(how_many);
+        last_used_tick = scheduler.CurrentTick();
+    }
+
+    [[nodiscard]] bool IsDead() const {
+        return BankBase::IsDead() && scheduler.IsFree(last_used_tick);
     }
 
     void Sync(size_t start, size_t size) {
@@ -98,9 +109,11 @@ public:
 
 private:
     const Device& device;
+    Scheduler& scheduler;
     const size_t index;
     vk::QueryPool query_pool;
     std::array<u64, BANK_SIZE> host_results;
+    u64 last_used_tick{};
 };
 
 using BaseStreamer = VideoCommon::SimpleStreamer<VideoCommon::HostQueryBase>;
@@ -434,7 +447,7 @@ private:
     void ReserveBank() {
         current_bank_id =
             bank_pool.ReserveBank([this](std::deque<SamplesQueryBank>& queue, size_t index) {
-                queue.emplace_back(device, index);
+                queue.emplace_back(device, scheduler, index);
             });
         if (current_bank) {
             current_bank->next_bank = current_bank_id + 1;
@@ -624,6 +637,15 @@ public:
         VideoCommon::BankBase::Reset();
     }
 
+    void AddReference(size_t how_many = 1) {
+        BankBase::AddReference(how_many);
+        last_used_tick = scheduler.CurrentTick();
+    }
+
+    [[nodiscard]] bool IsDead() const {
+        return BankBase::IsDead() && scheduler.IsFree(last_used_tick);
+    }
+
     void Sync(StagingBufferRef& stagging_buffer, size_t extra_offset, size_t start, size_t size) {
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([this, dst_buffer = stagging_buffer.buffer, extra_offset, start,
@@ -649,6 +671,7 @@ private:
     Scheduler& scheduler;
     const size_t index;
     vk::Buffer buffer;
+    u64 last_used_tick{};
 };
 
 class PrimitivesSucceededStreamer;
@@ -926,7 +949,7 @@ private:
             return;
         }
         has_flushed_end_pending = false;
-                                                               
+
         // Refresh buffer state before ending transform feedback to ensure counters_count is up-to-date.
         UpdateBuffers();
         if (buffers_count == 0) {
