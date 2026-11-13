@@ -61,6 +61,7 @@
 #include "yuzu/nextendo/nextendo_package_bcat.h"
 #include "yuzu/nextendo/nextendo_save_sync.h"
 #include "yuzu/nextendo/nextendo_splatoon3_bcat.h"
+#include "yuzu/nextendo/nextendo_nat_test.h"
 #include "yuzu/nextendo/nextendo_ssbu_mods.h"
 #include "yuzu/nextendo/nextendo_updater.h"
 #include "yuzu/nextendo/nextendo_toast.h"
@@ -178,6 +179,8 @@ void MainWindow::NextendoConnectMenu() {
     nextendo_action_notifications = nextendo_menu->addAction(tr("Show Friend &Notifications"));
     nextendo_action_notifications->setCheckable(true);
     nextendo_menu->addSeparator();
+    connect(nextendo_menu->addAction(tr("Test &NAT Type...")), &QAction::triggered, this,
+            [this] { NextendoRunNatTest(); });
     connect(nextendo_menu->addAction(tr("Check for &Updates...")), &QAction::triggered, this,
             [this] { nextendo_updater->CheckInteractive(); });
 
@@ -809,6 +812,75 @@ void MainWindow::NextendoByamlDownloadFromMenu(u64 title_id) {
         return;
     }
     RunNextendoByamlDownloadWithProgress(title_id);
+}
+
+void MainWindow::NextendoRunNatTest() {
+    QProgressDialog progress(tr("Testing your NAT type..."), QString{}, 0, 0, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.show();
+    auto future = QtConcurrent::run([] { return Nextendo::NatTest::Run(); });
+    while (!future.isFinished()) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    progress.close();
+    const auto result = future.result();
+
+    using Nextendo::NatTest::NatType;
+    QString name;
+    QString explanation;
+    switch (result.type) {
+    case NatType::OpenInternet:
+        name = tr("Open (no NAT)");
+        explanation = tr("Your PC has a public IP address. Online play works with everyone.");
+        break;
+    case NatType::FullCone:
+        name = tr("Full cone");
+        explanation = tr("The best NAT type. You can connect with every NAT type.");
+        break;
+    case NatType::RestrictedCone:
+        name = tr("Restricted cone");
+        explanation = tr("Good. You can connect with almost everyone.");
+        break;
+    case NatType::PortRestrictedCone:
+        name = tr("Port-restricted cone");
+        explanation = tr("Normal for home routers. You may fail to connect to players with a "
+                         "symmetric NAT. Opening UDP ports or enabling UPnP improves it.");
+        break;
+    case NatType::ConeUnknownFiltering:
+        name = tr("Cone (filtering not measured)");
+        explanation = tr("Your public port stays the same, which is what online play needs. The "
+                         "test server for the rest of the check did not answer.");
+        break;
+    case NatType::Symmetric:
+        name = tr("Symmetric");
+        explanation = tr("Strict. Your router changes the port for each player, so matches with "
+                         "other strict players fail. Enable UPnP or open UDP ports on the router, "
+                         "or avoid VPNs and double NAT (e.g. two routers).");
+        break;
+    case NatType::Blocked:
+        name = tr("UDP blocked");
+        explanation = tr("No test server answered over UDP. A firewall, VPN or network is "
+                         "blocking online play.");
+        break;
+    }
+
+    QString nextendo_line;
+    if (result.nextendo == Nextendo::NatTest::NextendoReach::Reachable) {
+        nextendo_line = result.nextendo_consistent_port
+                            ? tr("Nextendo NAT servers: reachable, consistent port.")
+                            : tr("Nextendo NAT servers: reachable.");
+    } else {
+        nextendo_line = tr("Nextendo NAT servers: not reachable over UDP. Check the network "
+                           "interface in Configure > Network (not a VPN adapter).");
+    }
+
+    QMessageBox::information(
+        this, tr("NAT Type"),
+        tr("NAT type: %1 (similar to Switch NAT type %2)\n\n%3\n\n%4")
+            .arg(name, QString::fromLatin1(Nextendo::NatTest::SwitchLetter(result.type)),
+                 explanation, nextendo_line));
 }
 
 void MainWindow::NextendoInstallSsbuMods(u64 title_id) {

@@ -260,6 +260,8 @@ add_executable(yuzu
     nextendo/nextendo_main_window.cpp
     nextendo/nextendo_package_bcat.h
     nextendo/nextendo_save_sync.cpp
+    nextendo/nextendo_nat_test.cpp
+    nextendo/nextendo_nat_test.h
     nextendo/nextendo_ssbu_mods.cpp
     nextendo/nextendo_updater.cpp
     nextendo/nextendo_updater.h
@@ -499,3 +501,6 @@ create_target_directory_groups(yuzu)
 # [Nextendo] Release version shown by the self-updater (set by CI from the git tag).
 set(NX_VERSION "dev" CACHE STRING "Nextendo build version (vX.Y.Z for releases)")
 target_compile_definitions(yuzu PRIVATE NX_VERSION="${NX_VERSION}")
+if (WIN32)
+    target_link_libraries(yuzu PRIVATE ws2_32) # NAT test sockets
+endif()

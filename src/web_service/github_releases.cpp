@@ -72,16 +72,27 @@ std::optional<Release> GetLatest(const std::string& owner, const std::string& re
 
     try {
         const auto json = nlohmann::json::parse(result->body);
+        // GitHub sends null (not "") for empty fields such as a release without notes.
+        const auto text = [](const nlohmann::json& object, const char* key) {
+            const auto it = object.find(key);
+            return it != object.end() && it->is_string() ? it->get<std::string>() : std::string{};
+        };
         Release release;
-        release.tag = json.value("tag_name", "");
-        release.html_url = json.value("html_url", "");
-        release.body = json.value("body", "");
-        for (const auto& asset : json.value("assets", nlohmann::json::array())) {
-            release.assets.push_back(Asset{
-                .name = asset.value("name", ""),
-                .download_url = asset.value("browser_download_url", ""),
-                .size = asset.value("size", std::size_t{0}),
-            });
+        release.tag = text(json, "tag_name");
+        release.html_url = text(json, "html_url");
+        release.body = text(json, "body");
+        const auto assets = json.find("assets");
+        if (assets != json.end() && assets->is_array()) {
+            for (const auto& asset : *assets) {
+                const auto size = asset.find("size");
+                release.assets.push_back(Asset{
+                    .name = text(asset, "name"),
+                    .download_url = text(asset, "browser_download_url"),
+                    .size = size != asset.end() && size->is_number_unsigned()
+                                ? size->get<std::size_t>()
+                                : std::size_t{0},
+                });
+            }
         }
         return release;
     } catch (const nlohmann::json::exception& e) {

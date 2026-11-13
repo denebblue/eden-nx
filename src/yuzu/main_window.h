@@ -189,6 +189,7 @@ public:
     void OfferNextendoByamlDownload(u64 title_id);
     void NextendoByamlDownloadFromMenu(u64 title_id);
     void NextendoInstallSsbuMods(u64 title_id);
+    void NextendoRunNatTest();
     bool NextendoByamlRequired(u64 title_id) const;
     bool NextendoByamlInstalled(u64 title_id) const;
     bool NextendoByamlSkipped(u64 title_id) const;
