@@ -828,9 +828,7 @@ void MainWindow::NextendoInstallSsbuMods(u64 title_id) {
         QMessageBox::warning(
             this, tr("SSBU Online Mods"),
             tr("These mods need Super Smash Bros. Ultimate %1 or newer, but the installed "
-               "version is %2.
-
-Install the %1 update (File > Install Files to NAND, or add "
+               "version is %2.\n\nInstall the %1 update (File > Install Files to NAND, or add "
                "its folder to the game list) and try again.")
                 .arg(QString::fromLatin1(Nextendo::SsbuMods::RequiredVersion),
                      version.empty() ? tr("unknown (no update installed)")
@@ -842,9 +840,7 @@ Install the %1 update (File > Install Files to NAND, or add "
             this, tr("SSBU Online Mods"),
             tr("This downloads the latest SSBU Online Deluxe mod set (ozone, ARCropolis, "
                "Smashline, nro-hook, imgui-smash, PIA manager, ssbusync and Online Deluxe) and "
-               "installs it on the emulated SD card.
-
-The current loader and plugins are "
+               "installs it on the emulated SD card.\n\nThe current loader and plugins are "
                "backed up first, and nothing is changed if any download fails. Continue?"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
         return;
