@@ -952,8 +952,9 @@ void MainWindow::NextendoInstallSsbuMods(u64 title_id) {
             text += QStringLiteral("<br><br>") + tr("Warnings:") + list(report.warnings);
         }
         text += QStringLiteral("<br><br>") +
-                tr("The RNG seed workaround these mods need on Eden is applied automatically "
-                   "when the game starts.");
+                tr("They are installed on the emulated SD card, so the game's Add-Ons tab lists "
+                   "them as a single \"SDMC\" entry. The RNG seed workaround these mods need on "
+                   "Eden is applied automatically when the game starts.");
     } else {
         text = tr("The mods were not installed and nothing was changed:") + list(report.errors);
     }

@@ -352,18 +352,61 @@ Report Install() {
         }
     }
 
-    // 5. A mod under load/<title id>/ that ships its own exefs would override ozone.
+    // 5. Mods under load/<title id>/ are layered over the SD card, so one that ships its own
+    //    exefs (an older Skyline) replaces ozone, and one carrying a conflicting plugin (e.g.
+    //    Latency Slider DE) still loads. Move such mods out of the load folder into the backup;
+    //    warning was not enough (users kept hitting the Latency Slider error and a crash).
     const fs::path load_dir =
         Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) / "01006A800016E000";
+    const auto has_conflicting_plugin = [&](const fs::path& mod_dir) {
+        const fs::path plugins = mod_dir / "romfs" / "skyline" / "plugins";
+        if (!fs::is_directory(plugins, ec)) {
+            return false;
+        }
+        for (const auto& plugin : fs::directory_iterator(plugins, ec)) {
+            const std::string name = Lower(plugin.path().filename().string());
+            if (std::ranges::any_of(ConflictingPluginMarkers, [&](const char* marker) {
+                    return name.find(marker) != std::string::npos;
+                })) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<fs::path> to_disable;
     if (fs::is_directory(load_dir, ec)) {
         for (const auto& mod : fs::directory_iterator(load_dir, ec)) {
-            if (fs::exists(mod.path() / "exefs" / "subsdk9", ec) ||
-                fs::exists(mod.path() / "exefs" / "main.npdm", ec)) {
-                report.warnings.push_back(fmt::format(
-                    "The mod \"{}\" in the load folder replaces the game loader and will break "
-                    "these mods. Disable it in the game's Add-Ons tab.",
-                    mod.path().filename().string()));
+            if (!mod.is_directory()) {
+                continue;
             }
+            if (fs::exists(mod.path() / "exefs" / "subsdk9", ec) ||
+                fs::exists(mod.path() / "exefs" / "main.npdm", ec) ||
+                has_conflicting_plugin(mod.path())) {
+                to_disable.push_back(mod.path());
+            }
+        }
+    }
+    for (const auto& mod : to_disable) {
+        const fs::path destination = backup_root / "load-disabled" / mod.filename();
+        fs::create_directories(destination.parent_path(), ec);
+        fs::rename(mod, destination, ec);
+        if (ec) {
+            ec.clear();
+            fs::copy(mod, destination, fs::copy_options::recursive, ec);
+            if (!ec) {
+                fs::remove_all(mod, ec);
+            }
+        }
+        if (ec) {
+            report.warnings.push_back(fmt::format(
+                "Could not disable the mod \"{}\" in the load folder; disable it in the game's "
+                "Add-Ons tab, it replaces the loader these mods need.",
+                mod.filename().string()));
+            ec.clear();
+        } else {
+            report.removed_conflicts.push_back(
+                fmt::format("{} (load folder mod, moved to the backup)", mod.filename().string()));
+            report.backup_dir = backup_root;
         }
     }
 
