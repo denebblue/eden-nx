@@ -52,16 +52,24 @@ struct Endpoint {
     bool operator==(const Endpoint&) const = default;
 };
 
-// Public STUN servers. The first implements RFC 5780 (OTHER-ADDRESS, CHANGE-REQUEST), which the
-// filtering test needs; the others only answer plain binding requests (mapping test).
+// Public STUN servers. The ones marked change_capable advertise an alternate address and accept
+// CHANGE-REQUEST (RFC 3489/5780). Public servers come and go and some ignore CHANGE-REQUEST, so
+// filtering is never inferred from what a server claims: only from where replies actually come
+// from (see Run()).
 struct StunServer {
     const char* host;
     u16 port;
+    bool change_capable;
 };
-constexpr std::array<StunServer, 3> StunServers{{
-    {"stun.stunprotocol.org", 3478},
-    {"stun.l.google.com", 19302},
-    {"stun.cloudflare.com", 3478},
+constexpr std::array<StunServer, 8> StunServers{{
+    {"stun.l.google.com", 19302, false},
+    {"stun.cloudflare.com", 3478, false},
+    {"stun.voip.aebc.com", 3478, true},
+    {"stun.1und1.de", 3478, true},
+    {"stun.schlund.de", 3478, true},
+    {"stun.gmx.net", 3478, true},
+    {"stun.sipgate.net", 3478, true},
+    {"stun.nextcloud.com", 3478, true},
 }};
 
 constexpr u32 MagicCookie = 0x2112A442;
@@ -173,6 +181,7 @@ private:
 };
 
 struct StunReply {
+    Endpoint source; // where the reply actually came from
     Endpoint mapped;
     std::optional<Endpoint> other;
 };
@@ -224,6 +233,7 @@ std::optional<StunReply> StunRequest(UdpSocket& socket, const Endpoint& server, 
                 continue; // stray or late reply to an earlier request
             }
             StunReply reply{};
+            reply.source = datagram->first;
             bool has_mapped = false;
             std::size_t offset = 20;
             while (offset + 4 <= data.size()) {
@@ -331,36 +341,59 @@ Result Run() {
     result.nextendo = nncs.reachable ? NextendoReach::Reachable : NextendoReach::Unreachable;
     result.nextendo_consistent_port = nncs.consistent;
 
+    // Everything below uses ONE local socket, so the router keeps one mapping for it.
     UdpSocket socket;
     if (!socket.Valid()) {
         return result;
     }
 
-    // Mapping: the public endpoint seen by every server we can reach, from one local socket.
+    // Every endpoint a packet was sent to. A reply from an endpoint outside this set can only get
+    // through if the router accepts traffic from addresses it never contacted -- that, not what
+    // the server claims, is what proves the filtering type.
+    std::vector<Endpoint> sent_to;
+    const auto sent = [&](const Endpoint& e) {
+        sent_to.push_back(e);
+    };
+    const auto ip_contacted = [&](u32 ip) {
+        return std::ranges::any_of(sent_to, [ip](const Endpoint& e) { return e.ip == ip; });
+    };
+    const auto endpoint_contacted = [&](const Endpoint& endpoint) {
+        return std::ranges::any_of(sent_to, [&](const Endpoint& e) { return e == endpoint; });
+    };
+    bool reply_from_new_ip = false;
+    bool reply_from_new_port = false;
+    const auto note_source = [&](const StunReply& reply) {
+        if (!ip_contacted(reply.source.ip)) {
+            reply_from_new_ip = true;
+        } else if (!endpoint_contacted(reply.source)) {
+            reply_from_new_port = true;
+        }
+    };
+
     std::vector<Endpoint> mapped;
-    std::optional<Endpoint> primary;
-    std::optional<StunReply> primary_reply;
-    for (std::size_t i = 0; i < StunServers.size(); ++i) {
-        const auto ip = Resolve(StunServers[i].host);
+    struct ChangeServer {
+        Endpoint endpoint;
+        Endpoint other;
+    };
+    std::vector<ChangeServer> change_servers;
+    for (const auto& server_info : StunServers) {
+        const auto ip = Resolve(server_info.host);
         if (!ip) {
             continue;
         }
-        const Endpoint server{*ip, StunServers[i].port};
+        const Endpoint server{*ip, server_info.port};
+        sent(server);
         const auto reply = StunRequest(socket, server, 0);
         if (!reply) {
             continue;
         }
+        note_source(*reply);
         mapped.push_back(reply->mapped);
-        if (i == 0) {
-            primary = server;
-            primary_reply = reply;
-        }
-    }
-    // RFC 5780 mapping test: same server, alternate IP.
-    if (primary_reply && primary_reply->other) {
-        const Endpoint alternate{primary_reply->other->ip, primary->port};
-        if (const auto reply = StunRequest(socket, alternate, 0)) {
-            mapped.push_back(reply->mapped);
+        // A usable alternate must be a different public IP than the one we talked to.
+        if (server_info.change_capable && reply->other && reply->other->ip != server.ip &&
+            (reply->other->ip >> 24) != 10 && (reply->other->ip >> 24) != 127 &&
+            (reply->other->ip >> 20) != 0xAC1 && (reply->other->ip >> 16) != 0xC0A8) {
+            change_servers.push_back({server, *reply->other});
         }
     }
 
@@ -398,18 +431,33 @@ Result Run() {
         }
     }
 
-    // Filtering: ask the RFC 5780 server to answer from another IP+port, then another port.
-    if (!primary || !primary_reply || !primary_reply->other) {
-        result.type = NatType::ConeUnknownFiltering;
-        return result;
+    // Filtering: ask change-capable servers to answer from their alternate IP+port, then from
+    // their alternate port. Stop as soon as one reply proves the most permissive case.
+    for (const auto& server : change_servers) {
+        if (reply_from_new_ip) {
+            break;
+        }
+        if (const auto reply = StunRequest(socket, server.endpoint, ChangeIp | ChangePort)) {
+            note_source(*reply);
+        }
+        if (!reply_from_new_ip && !reply_from_new_port) {
+            if (const auto reply = StunRequest(socket, server.endpoint, ChangePort)) {
+                note_source(*reply);
+            }
+        }
     }
-    if (StunRequest(socket, *primary, ChangeIp | ChangePort)) {
+
+    if (reply_from_new_ip) {
         result.type = NatType::FullCone;
-    } else if (StunRequest(socket, *primary, ChangePort)) {
+    } else if (reply_from_new_port) {
         result.type = NatType::RestrictedCone;
-    } else {
+    } else if (!change_servers.empty()) {
         result.type = NatType::PortRestrictedCone;
+    } else {
+        result.type = NatType::ConeUnknownFiltering;
     }
+    LOG_INFO(Frontend, "[Nextendo] NAT test: {} STUN replies, {} change-capable servers, type {}",
+             mapped.size(), change_servers.size(), static_cast<int>(result.type));
     return result;
 }
 
