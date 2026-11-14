@@ -459,7 +459,11 @@ void Maxwell3D::ProcessMacroUpload(u32 data) {
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
-    macro_positions[regs.load_mme.start_address_ptr++] = data;
+    // The MME start-address RAM has macro_positions.size() entries and the pointer wraps on
+    // hardware, as CallMacroMethod's lookup already assumes. Without the wrap, a game (or stale
+    // pushbuffer data) binding past the end wrote out of bounds and crashed the emulator
+    // (Super Smash Bros. Ultimate with Skyline plugins).
+    macro_positions[regs.load_mme.start_address_ptr++ % macro_positions.size()] = data;
 }
 
 void Maxwell3D::ProcessFirmwareCall4() {
