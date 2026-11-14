@@ -180,6 +180,13 @@ ImageInfo::ImageInfo(const Maxwell3D::Regs::RenderTargetConfig& ct,
         type = ImageType::e2D;
         resources.layers = ct.depth;
     }
+    // A layered render target with array_pitch 0 left layer_stride 0, so its guest size came
+    // out as 0 and swizzling it wrote past a tiny buffer (crash in Tegra::Texture::Swizzle seen
+    // in Splatoon 2, preceded by "assert info.layer_stride != 0"). Derive the stride instead.
+    if (resources.layers > 1 && layer_stride == 0) {
+        layer_stride = CalculateLayerStride(*this);
+        maybe_unaligned_layer_stride = CalculateLayerSize(*this);
+    }
 }
 
 ImageInfo::ImageInfo(const Maxwell3D::Regs::Zeta& zt, const Maxwell3D::Regs::ZetaSize& zt_size,
@@ -222,6 +229,13 @@ ImageInfo::ImageInfo(const Maxwell3D::Regs::Zeta& zt, const Maxwell3D::Regs::Zet
             resources.layers = 1;
             break;
         }
+    }
+    // A layered render target with array_pitch 0 left layer_stride 0, so its guest size came
+    // out as 0 and swizzling it wrote past a tiny buffer (crash in Tegra::Texture::Swizzle seen
+    // in Splatoon 2, preceded by "assert info.layer_stride != 0"). Derive the stride instead.
+    if (resources.layers > 1 && layer_stride == 0) {
+        layer_stride = CalculateLayerStride(*this);
+        maybe_unaligned_layer_stride = CalculateLayerSize(*this);
     }
 }
 
