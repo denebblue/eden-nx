@@ -1618,31 +1618,39 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    // Upload the CPU-written ranges, skipping the parts the GPU modified so its data isn't
+    // overwritten. Same as current upstream (#4473 semantics: ForEachInRange yields start/end).
+    // The #4094 variant downloaded GPU-modified data before every upload instead, which waits
+    // for the GPU and cut Super Smash Bros. Ultimate from 60 to ~23 FPS on a Quadro M620.
     upload_copies.clear();
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
     const DAddr buffer_start = buffer.cpu_addr_cached;
-    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+    const auto add_upload = [&](DAddr start, DAddr end) {
+        if (start >= end) {
+            return;
+        }
+        const u64 range_size = end - start;
         upload_copies.push_back(BufferCopy{
             .src_offset = total_size_bytes,
-            .dst_offset = device_addr_out - buffer_start,
+            .dst_offset = start - buffer_start,
             .size = range_size,
         });
         total_size_bytes += range_size;
         largest_copy = (std::max)(largest_copy, range_size);
+    };
+    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+        DAddr upload_start = device_addr_out;
+        gpu_modified_ranges.ForEachInRange(device_addr_out, range_size,
+                                           [&](DAddr gpu_start, DAddr gpu_end) {
+                                               add_upload(upload_start, gpu_start);
+                                               upload_start = (std::max)(upload_start, gpu_end);
+                                           });
+        add_upload(upload_start, device_addr_out + range_size);
     });
     if (total_size_bytes == 0) {
         return true;
     }
-    u64 min_offset = (std::numeric_limits<u64>::max)();
-    u64 max_offset = 0;
-    for (const auto& copy : upload_copies) {
-        min_offset = (std::min)(min_offset, copy.dst_offset);
-        max_offset = (std::max)(max_offset, copy.dst_offset + copy.size);
-    }
-    const DAddr sync_addr = buffer.CpuAddr() + min_offset;
-    const u64 sync_size = max_offset - min_offset;
-    DownloadBufferMemory(buffer, sync_addr, sync_size);
     const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
     UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
     any_buffer_uploaded = true;
