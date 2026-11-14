@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +39,9 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/ns/platform_service_manager.h"
 #include "core/loader/loader.h"
+#ifdef ENABLE_WEB_SERVICE
+#include "web_service/nextendo_api.h"
+#endif
 
 namespace Service::AM::Frontend {
 
@@ -453,6 +457,13 @@ void WebBrowser::Execute() {
         return;
     }
 
+    // [Nextendo] Share posts (Splatoon 2 plaza) need no web view; handle them even when the web
+    // applet is disabled.
+    if (web_arg_header.shim_kind == ShimKind::Share) {
+        ExecuteShare();
+        return;
+    }
+
     if (Settings::values.disable_web_applet) {
         LOG_WARNING(Service_AM, "(STUBBED) called, Web Browser Applet is disabled. shim_kind={}",
                     web_arg_header.shim_kind);
@@ -730,8 +741,62 @@ void WebBrowser::ExecuteOffline() {
 }
 
 void WebBrowser::ExecuteShare() {
-    LOG_WARNING(Service_AM, "(STUBBED) called, Share Applet is not implemented");
+#ifdef ENABLE_WEB_SERVICE
+    namespace fs = std::filesystem;
+    // The game saves the post image to the album right before opening the applet
+    // (ApplicationAlbumEntry TLV 0x26); take the newest screenshot saved in the last 30 s.
+    std::error_code ec;
+    const fs::path shots = Common::FS::GetEdenPath(Common::FS::EdenPath::ScreenshotsDir);
+    fs::path image_path;
+    fs::file_time_type newest_time{};
+    for (auto it = fs::recursive_directory_iterator(shots, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().extension() == ".png" &&
+            it->last_write_time(ec) > newest_time) {
+            newest_time = it->last_write_time(ec);
+            image_path = it->path();
+        }
+    }
+    if (image_path.empty() ||
+        fs::file_time_type::clock::now() - newest_time > std::chrono::seconds(30)) {
+        LOG_WARNING(Service_AM, "[Nextendo][Share] No fresh album image to post; cancelling");
+        WebBrowserExit(WebExitReason::EndButtonPressed);
+        return;
+    }
+    std::vector<u8> png(static_cast<size_t>(fs::file_size(image_path, ec)));
+    {
+        std::ifstream in{image_path, std::ios::binary};
+        in.read(reinterpret_cast<char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    }
+
+    std::string user_id_hex;
+    if (const auto user = GetInputTLVData(WebArgInputTLVType::UserID)) {
+        for (const u8 byte : *user) {
+            user_id_hex += fmt::format("{:02x}", byte);
+        }
+    }
+    const auto title_id_hex = fmt::format("{:016X}", system.GetApplicationProcessProgramID());
+
+    const std::string error = WebService::NextendoApi::PushSharePost(title_id_hex, png, user_id_hex);
+    if (!error.empty()) {
+        LOG_WARNING(Service_AM, "[Nextendo][Share] Post upload failed: {}", error);
+        WebBrowserExit(WebExitReason::EndButtonPressed);
+        return;
+    }
+
+    // Which exit reason the game reads as "posted" is not documented; ExitRequested by default,
+    // overridable with NEXTENDO_SHARE_EXIT_REASON (0-7) to test others.
+    auto reason = WebExitReason::ExitRequested;
+    if (const char* env = std::getenv("NEXTENDO_SHARE_EXIT_REASON"); env && *env) {
+        reason = static_cast<WebExitReason>(std::strtoul(env, nullptr, 10));
+    }
+    LOG_INFO(Service_AM, "[Nextendo][Share] Posted {} ({} bytes) for {}; answering exit reason {}",
+             Common::FS::PathToUTF8String(image_path.filename()), png.size(), title_id_hex,
+             static_cast<u32>(reason));
+    WebBrowserExit(reason);
+#else
     WebBrowserExit(WebExitReason::EndButtonPressed);
+#endif
 }
 
 void WebBrowser::ExecuteWeb() {

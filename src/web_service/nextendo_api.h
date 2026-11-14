@@ -190,6 +190,12 @@ std::optional<std::vector<u8>> PullSave(const std::string& title_id_hex);
 // Returns an error message fit to show the user, or empty on success.
 std::string PushSave(const std::string& title_id_hex, std::span<const u8> data);
 
+// Share applet post (e.g. a Splatoon 2 plaza post): POST /api/share/<title_id_hex> with the PNG
+// as the raw body (Content-Type: image/png), the account's Bearer token, and the posting
+// profile's UUID in X-Nextendo-Share-User. Returns an empty string on any 2xx.
+std::string PushSharePost(const std::string& title_id_hex, std::span<const u8> png,
+                          const std::string& user_id_hex);
+
 // [Nextendo] Island of Animal Crossing: New Horizons, backed up by the game through olsc:u
 // (Service::OLSC::NextendoIsland). Raw request on /api/save/<title><suffix> with the account token,
 // on its own connection (an 11 MB island must not hold the shared client nor its 15 s timeout).

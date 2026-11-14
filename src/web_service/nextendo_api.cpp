@@ -285,7 +285,8 @@ httplib::Headers BaseHeaders() {
 }
 
 httplib::Result Send(const std::string& method, const std::string& path, const std::string& body,
-                     const std::string& bearer, const httplib::Headers& extra_headers = {}) {
+                     const std::string& bearer, const httplib::Headers& extra_headers = {},
+                     const char* content_type = "application/json") {
     static std::mutex client_mutex;
     std::lock_guard lock{client_mutex};
     httplib::Client& client = SharedClient();
@@ -299,8 +300,8 @@ httplib::Result Send(const std::string& method, const std::string& path, const s
     }
 
     auto result = method == "GET"    ? client.Get(path, headers)
-                 : method == "PUT"   ? client.Put(path, headers, body, "application/json")
-                                     : client.Post(path, headers, body, "application/json");
+                 : method == "PUT"   ? client.Put(path, headers, body, content_type)
+                                     : client.Post(path, headers, body, content_type);
     if (!result) {
         LOG_ERROR(WebService, "Send {} {}: httplib error={}", method, path,
                   httplib::to_string(result.error()));
@@ -609,6 +610,27 @@ std::string PushSave(const std::string& title_id_hex, std::span<const u8> data) 
     }
     if (result->status != 200) {
         return ErrorFrom(result->body, "Could not upload the save.");
+    }
+    return {};
+}
+
+std::string PushSharePost(const std::string& title_id_hex, std::span<const u8> png,
+                          const std::string& user_id_hex) {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return "Not signed in to Nextendo.";
+    }
+    const std::string body(reinterpret_cast<const char*>(png.data()), png.size());
+    const auto result = Send("POST", "/api/share/" + title_id_hex, body, token,
+                             {{"X-Nextendo-Share-User", user_id_hex}}, "image/png");
+    if (ClearSessionIfRejected(result)) {
+        return "Session expired.";
+    }
+    if (!result) {
+        return "Could not reach the Nextendo account server.";
+    }
+    if (result->status < 200 || result->status >= 300) {
+        return ErrorFrom(result->body, "Could not upload the post.");
     }
     return {};
 }
