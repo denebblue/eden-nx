@@ -330,7 +330,14 @@ void Scheduler::EndPendingOperations() {
     // dropped the samples the guest had already counted: a submit between the guest's counter
     // clear and its report made that report read zero, hiding the tested object for a frame
     // (Pokemon Legends Z-A flicker). From upstream PR #4605.
-    query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+    // Accurate only (Pokemon Legends Z-A needs Accurate anyway): keeping the samples across
+    // submits is suspected of slowing long Super Smash Bros. Ultimate sessions at Fast, so the
+    // other levels keep the original reset.
+    if (Settings::IsGPULevelHigh()) {
+        query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+    } else {
+        query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
+    }
     EndRenderPass();
 }
 
