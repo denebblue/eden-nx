@@ -337,14 +337,34 @@ std::vector<u8> HLERequestContext::ReadBufferCopy(std::size_t buffer_index) cons
     }
 }
 
+namespace {
+// Large input buffers (e.g. a 1280x720 screenshot handed to caps:su) can still hold data the GPU
+// wrote but has not flushed back to guest memory; read those with a GPU flush so they don't come
+// out blank (Splatoon 2 plaza posts were empty images). Small buffers keep the fast path.
+constexpr std::size_t SafeReadThreshold = 1024 * 1024;
+
+std::span<const u8> ReadGuestBuffer(Core::Memory::Memory& memory, u64 address, std::size_t size,
+                                    Common::ScratchBuffer<u8>* backup) {
+    if (size >= SafeReadThreshold) {
+        // Copy with ReadBlock (not a direct span): it downloads GPU-modified pages first.
+        backup->resize_destructive(size);
+        memory.ReadBlock(address, backup->data(), size);
+        return std::span<const u8>(backup->data(), size);
+    }
+    Core::Memory::CpuGuestMemory<u8, Core::Memory::GuestMemoryFlags::UnsafeRead> gm(memory, 0, 0);
+    return gm.Read(address, size, backup);
+}
+} // namespace
+
 std::span<const u8> HLERequestContext::ReadBufferA(std::size_t buffer_index) const {
     Core::Memory::CpuGuestMemory<u8, Core::Memory::GuestMemoryFlags::UnsafeRead> gm(memory, 0, 0);
 
     ASSERT_OR_EXECUTE_MSG(
         BufferDescriptorA().size() > buffer_index, { return {}; },
         "BufferDescriptorA invalid buffer_index {}", buffer_index);
-    return gm.Read(BufferDescriptorA()[buffer_index].Address(),
-                   BufferDescriptorA()[buffer_index].Size(), &read_buffer_data_a[buffer_index]);
+    return ReadGuestBuffer(memory, BufferDescriptorA()[buffer_index].Address(),
+                           BufferDescriptorA()[buffer_index].Size(),
+                           &read_buffer_data_a[buffer_index]);
 }
 
 std::span<const u8> HLERequestContext::ReadBufferX(std::size_t buffer_index) const {
@@ -375,8 +395,9 @@ std::span<const u8> HLERequestContext::ReadBuffer(std::size_t buffer_index) cons
         ASSERT_OR_EXECUTE_MSG(
             BufferDescriptorA().size() > buffer_index, { return {}; },
             "BufferDescriptorA invalid buffer_index {}", buffer_index);
-        return gm.Read(BufferDescriptorA()[buffer_index].Address(),
-                       BufferDescriptorA()[buffer_index].Size(), &read_buffer_data_a[buffer_index]);
+        return ReadGuestBuffer(memory, BufferDescriptorA()[buffer_index].Address(),
+                               BufferDescriptorA()[buffer_index].Size(),
+                               &read_buffer_data_a[buffer_index]);
     } else {
         ASSERT_OR_EXECUTE_MSG(
             BufferDescriptorX().size() > buffer_index, { return {}; },

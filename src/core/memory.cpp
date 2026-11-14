@@ -683,6 +683,15 @@ struct Memory::Impl {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
         const size_t core = system.GetCurrentHostThreadID();
+        if (core >= Core::Hardware::NUM_CPU_CORES) [[unlikely]] {
+            // HLE service threads (e.g. a safe read of a large IPC buffer) have host thread IDs
+            // past the per-core caches; flush directly with a thread-local scratch buffer.
+            thread_local Common::ScratchBuffer<u32> service_scratch;
+            gpu_device_memory->ApplyOpOnPointer(p, service_scratch, [&](DAddr address) {
+                system.GPU().OnCPURead(address, size);
+            });
+            return;
+        }
         auto& current_area = rasterizer_read_areas[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
