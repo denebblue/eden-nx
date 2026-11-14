@@ -630,7 +630,10 @@ std::string PushSharePost(const std::string& title_id_hex, std::span<const u8> p
         return "Could not reach the Nextendo account server.";
     }
     if (result->status < 200 || result->status >= 300) {
-        return ErrorFrom(result->body, "Could not upload the post.");
+        // Include the status and the start of the body: a framework's default 404/400 page has
+        // no {"error": ...} and would otherwise hide what went wrong.
+        return fmt::format("HTTP {} {}", result->status,
+                           ErrorFrom(result->body, result->body.substr(0, 300)));
     }
     return {};
 }
