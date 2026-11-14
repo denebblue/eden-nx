@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <span>
 #include <cstring>
 #include <string_view>
 #include <vector>
@@ -303,6 +307,57 @@ void ExtractSharedFonts(Core::System& system) {
     }
 }
 
+
+// [Nextendo] Diagnostic for the Share applet (Splatoon 2 plaza posts): saves the raw input
+// arguments, logs every TLV and copies the screenshot the game captured just before, so the
+// server-side post format can be built from what the game actually sends.
+void DumpShareArguments(std::span<const u8> web_arg, const WebArgInputTLVMap& tlvs,
+                        u64 program_id) {
+    namespace fs = std::filesystem;
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const fs::path dir = Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir) / "share" /
+                         fmt::format("{:016X}_{}", program_id, stamp);
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    {
+        std::ofstream raw{dir / "web_args.bin", std::ios::binary};
+        raw.write(reinterpret_cast<const char*>(web_arg.data()),
+                  static_cast<std::streamsize>(web_arg.size()));
+    }
+    std::ofstream txt{dir / "tlvs.txt"};
+    for (const auto& [type, data] : tlvs) {
+        std::string hex;
+        std::string ascii;
+        for (const u8 byte : data) {
+            hex += fmt::format("{:02X}", byte);
+            ascii += (byte >= 0x20 && byte < 0x7F) ? static_cast<char>(byte) : '.';
+        }
+        const std::string line = fmt::format("TLV 0x{:02X} size={} hex={} ascii={}",
+                                             static_cast<u16>(type), data.size(), hex, ascii);
+        txt << line << '\n';
+        LOG_INFO(Service_AM, "[Nextendo][Share] {}",
+                 line.size() > 400 ? line.substr(0, 400) + "..." : line);
+    }
+    // The screenshot the game saved right before opening the applet.
+    const fs::path shots = Common::FS::GetEdenPath(Common::FS::EdenPath::ScreenshotsDir);
+    fs::path newest;
+    fs::file_time_type newest_time{};
+    for (auto it = fs::recursive_directory_iterator(shots, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->last_write_time(ec) > newest_time) {
+            newest_time = it->last_write_time(ec);
+            newest = it->path();
+        }
+    }
+    if (!newest.empty() && fs::file_time_type::clock::now() - newest_time < std::chrono::seconds(30)) {
+        fs::copy_file(newest, dir / newest.filename(), fs::copy_options::overwrite_existing, ec);
+    }
+    LOG_INFO(Service_AM, "[Nextendo][Share] {} TLVs dumped to {}", tlvs.size(),
+             Common::FS::PathToUTF8String(dir));
+}
+
 } // namespace
 
 WebBrowser::WebBrowser(Core::System& system_, std::shared_ptr<Applet> applet_,
@@ -333,6 +388,9 @@ void WebBrowser::Initialize() {
     ASSERT_OR_EXECUTE(web_arg.size() >= sizeof(WebArgHeader), { return; });
 
     web_arg_input_tlv_map = ReadWebArgs(web_arg, web_arg_header);
+    if (web_arg_header.shim_kind == ShimKind::Share) {
+        DumpShareArguments(web_arg, web_arg_input_tlv_map, system.GetApplicationProcessProgramID());
+    }
 
     LOG_DEBUG(Service_AM, "WebArgHeader: total_tlv_entries={}, shim_kind={}",
               web_arg_header.total_tlv_entries, web_arg_header.shim_kind);
