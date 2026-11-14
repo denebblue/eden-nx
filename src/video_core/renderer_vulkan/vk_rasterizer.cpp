@@ -239,7 +239,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    if (compute_writes_need_graphics_barrier) {
+    // Accurate only: the barrier ends the render pass after every compute dispatch, which costs
+    // frame rate on weaker GPUs at Fast/High.
+    if (compute_writes_need_graphics_barrier && Settings::IsGPULevelHigh()) {
         // Guest compute can produce indirect draw arguments, index/vertex data or storage data
         // that the following draws read (e.g. GPU-driven culling). Nothing else orders those
         // shader writes before graphics reads, so a draw could consume the previous frame's
