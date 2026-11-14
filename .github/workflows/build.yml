@@ -74,13 +74,17 @@ jobs:
           New-Item -ItemType Directory -Force dist-win | Out-Null
           Copy-Item build/bin/* dist-win -Recurse -Exclude *.pdb,*.ilk,*.lib,*.exp
           New-Item -ItemType Directory -Force dist-win/user | Out-Null  # modo portable
+          # Keep only eden.exe and eden-cli.exe at the top level; everything else goes to tools/.
+          New-Item -ItemType Directory -Force dist-win/tools | Out-Null
+          Get-ChildItem dist-win -File | Where-Object { $_.Name -notin @('eden.exe', 'eden-cli.exe') } |
+            Move-Item -Destination dist-win/tools
           # File list of this version, used by the self-updater to remove it cleanly later.
           Push-Location dist-win
-          Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '[\\/]user[\\/]' } |
-            ForEach-Object { (Resolve-Path -Relative $_.FullName).Substring(2) } |
-            Set-Content -Encoding utf8 nx-manifest.txt
-          Add-Content -Encoding utf8 nx-manifest.txt 'nx-manifest.txt'
+          $files = Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '[\\/]user[\\/]' } |
+            ForEach-Object { (Resolve-Path -Relative $_.FullName).Substring(2) }
+          @($files) + 'tools\nx-manifest.txt' | Set-Content -Encoding utf8 tools/nx-manifest.txt
           Pop-Location
+          Get-ChildItem dist-win -Recurse -File | Select-Object -ExpandProperty FullName
           Compress-Archive -Path dist-win/* -DestinationPath eden-nextendo-windows-x64.zip
           # Debug symbols, shipped separately so crash offsets can be resolved
           New-Item -ItemType Directory -Force dist-pdb | Out-Null

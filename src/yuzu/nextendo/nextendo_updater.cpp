@@ -300,9 +300,15 @@ void NextendoUpdater::DownloadAndInstall(const QString& tag) {
     // Run the helper from outside the install folder so it can replace itself. Prefer the copy
     // shipped with the new version.
     std::error_code ec;
-    fs::path helper_source = staging / HelperName;
-    if (!fs::exists(helper_source, ec)) {
-        helper_source = install_dir / HelperName;
+    // Since v1.2.2 the helper lives in tools/ so only eden.exe and eden-cli.exe sit at the top.
+    fs::path helper_source;
+    for (const fs::path& candidate :
+         {staging / "tools" / HelperName, staging / HelperName, install_dir / "tools" / HelperName,
+          install_dir / HelperName}) {
+        if (fs::exists(candidate, ec)) {
+            helper_source = candidate;
+            break;
+        }
     }
     const fs::path helper = staging.parent_path() / HelperName;
     fs::copy_file(helper_source, helper, fs::copy_options::overwrite_existing, ec);

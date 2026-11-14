@@ -160,7 +160,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     const std::set<fs::path> new_files = ListFiles(source);
-    std::set<fs::path> old_files = ReadManifest(target / ManifestName);
+    // The manifest moved into tools/ in v1.2.2; older installs keep it at the top level.
+    std::set<fs::path> old_files = ReadManifest(target / L"tools" / ManifestName);
+    for (const auto& file : ReadManifest(target / ManifestName)) {
+        old_files.insert(file);
+    }
     // Builds without a manifest: only the files this version replaces are known to be ours.
     for (const auto& file : new_files) {
         if (fs::exists(target / file)) {
