@@ -86,14 +86,7 @@ bool DmaPusher::Step() {
         const bool use_safe = Settings::IsDMALevelDefault()
                                   ? (Settings::IsGPULevelMedium() || Settings::IsGPULevelHigh())
                                   : Settings::IsDMALevelSafe();
-        // Commands or macro arguments the GPU wrote itself only exist in the buffer cache; an
-        // unsafe read would execute stale guest memory as commands (games that build part of
-        // their command stream on the GPU, likely why Pokemon Legends Z-A doesn't boot on Fast).
-        // Only those segments pay for the download. From upstream PR #4605.
-        const bool gpu_written =
-            !use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32),
-                                                      VideoCommon::CacheType::BufferCache);
-        if (use_safe || gpu_written) {
+        if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             ProcessCommands(headers);
         } else {
