@@ -535,10 +535,9 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
         size_t current_offset = sizeof(WebArgHeader);
         u16 tlv_count = 0;
 
-        // align and matchng TLV struct alignment
-        auto align_offset = [](size_t offset) -> size_t {
-            return (offset + 7) & ~static_cast<size_t>(7);
-        };
+        // TLVs are packed back to back: the SDK reader (nn::web::*ReturnValue getters) walks
+        // them with offset += sizeof(WebArgOutputTLV) + arg_data_size, with no alignment.
+        // Padding after the 4-byte exit reason hid every later TLV from the game.
 
         // 0x1 ShareExitReason
         {
@@ -553,7 +552,6 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
             std::memcpy(out_data.data() + current_offset, &exit_reason_value, sizeof(u32));
             current_offset += sizeof(u32);
 
-            current_offset = align_offset(current_offset);
             tlv_count++;
         }
 
@@ -570,7 +568,6 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
             // null terminator
             std::memcpy(out_data.data() + current_offset, last_url.c_str(), last_url.size() + 1);
             current_offset += url_data_size;
-            current_offset = align_offset(current_offset);
             tlv_count++;
         }
 
@@ -591,7 +588,6 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
 
         // 0x4 SharePostResult: what the game reads to tell a completed post from a cancelled one.
         if (web_arg_header.shim_kind == ShimKind::Share && share_post_result) {
-            current_offset = align_offset(current_offset);
             WebArgOutputTLV tlv{};
             tlv.output_tlv_type = WebArgOutputTLVType::SharePostResult;
             tlv.arg_data_size = sizeof(u32);
@@ -601,6 +597,33 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
             std::memcpy(out_data.data() + current_offset, &post_result, sizeof(u32));
             current_offset += sizeof(u32);
             tlv_count++;
+
+            // 0x5/0x6 PostServiceName(+Size) and 0x7/0x8 PostId(+Size), NUL-terminated strings.
+            const auto push_string = [&](WebArgOutputTLVType type, WebArgOutputTLVType size_type,
+                                         const std::string& value) {
+                WebArgOutputTLV str_tlv{};
+                str_tlv.output_tlv_type = type;
+                str_tlv.arg_data_size = static_cast<u16>(value.size() + 1);
+                std::memcpy(out_data.data() + current_offset, &str_tlv, sizeof(WebArgOutputTLV));
+                current_offset += sizeof(WebArgOutputTLV);
+                std::memcpy(out_data.data() + current_offset, value.c_str(), value.size() + 1);
+                current_offset += value.size() + 1;
+                tlv_count++;
+
+                WebArgOutputTLV size_tlv{};
+                size_tlv.output_tlv_type = size_type;
+                size_tlv.arg_data_size = sizeof(u64);
+                std::memcpy(out_data.data() + current_offset, &size_tlv, sizeof(WebArgOutputTLV));
+                current_offset += sizeof(WebArgOutputTLV);
+                const u64 length = value.size();
+                std::memcpy(out_data.data() + current_offset, &length, sizeof(u64));
+                current_offset += sizeof(u64);
+                tlv_count++;
+            };
+            push_string(WebArgOutputTLVType::PostServiceName,
+                        WebArgOutputTLVType::PostServiceNameSize, share_post_service_name);
+            push_string(WebArgOutputTLVType::PostID, WebArgOutputTLVType::PostIDSize,
+                        share_post_id);
         }
 
         WebArgHeader out_header{};
@@ -809,6 +832,9 @@ void WebBrowser::ExecuteShare() {
     if (const char* env = std::getenv("NEXTENDO_SHARE_POST_RESULT"); env && *env) {
         share_post_result = static_cast<u32>(std::strtoul(env, nullptr, 10));
     }
+    // The game keeps these in its ShareId (service name: 15 chars max, post id: 255 max).
+    share_post_service_name = "Nextendo";
+    share_post_id = Common::FS::PathToUTF8String(image_path.stem()).substr(0, 255);
     LOG_INFO(Service_AM, "[Nextendo][Share] Posted {} ({} bytes) for {}; answering exit reason {}",
              Common::FS::PathToUTF8String(image_path.filename()), png.size(), title_id_hex,
              static_cast<u32>(reason));

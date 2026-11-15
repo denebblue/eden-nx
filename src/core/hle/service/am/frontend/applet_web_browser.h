@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <string>
 
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -78,6 +79,10 @@ private:
     WebArgInputTLVMap web_arg_input_tlv_map;
     // [Nextendo] SharePostResult output TLV (0 = completed, 1 = cancelled); unset = not sent.
     std::optional<u32> share_post_result;
+    // [Nextendo] PostServiceName / PostId sent with a completed post. The SDK copies both
+    // without a null check once the result is Completed, so they must always be present.
+    std::string share_post_service_name;
+    std::string share_post_id;
 
     u64 title_id{};
     FileSys::ContentRecordType nca_type{};
