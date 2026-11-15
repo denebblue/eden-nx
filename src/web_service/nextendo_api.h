@@ -267,4 +267,8 @@ HistoryList GetHistory();
 // Round-trip time to the backend's /api/health in milliseconds, or nullopt on failure.
 std::optional<int> PingBackend();
 
+// Real UTC time minus this PC's UTC clock, in seconds, read from the server's HTTP Date header
+// (1 s resolution), or nullopt when the server can't be reached.
+std::optional<s64> FetchServerTimeSkewSeconds();
+
 } // namespace WebService::NextendoApi

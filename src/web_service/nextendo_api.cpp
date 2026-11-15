@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -1323,6 +1325,55 @@ std::optional<int> PingBackend() {
         return std::nullopt;
     }
     return static_cast<int>(elapsed_ms.count());
+}
+
+namespace {
+// Seconds since the Unix epoch for an RFC 7231 HTTP date ("Sun, 15 Nov 2026 06:40:00 GMT").
+std::optional<s64> ParseHttpDate(const std::string& value) {
+    static constexpr std::array<const char*, 12> months{"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    char weekday[4]{}, month_name[4]{}, zone[4]{};
+    int day = 0, year = 0, hour = 0, minute = 0, second = 0;
+    if (std::sscanf(value.c_str(), "%3s %d %3s %d %d:%d:%d %3s", weekday, &day, month_name, &year,
+                    &hour, &minute, &second, zone) != 8 ||
+        std::string_view{zone} != "GMT") {
+        return std::nullopt;
+    }
+    const auto month_it = std::find_if(months.begin(), months.end(), [&](const char* name) {
+        return std::string_view{name} == month_name;
+    });
+    if (month_it == months.end() || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) {
+        return std::nullopt;
+    }
+    // Days from civil (Howard Hinnant's algorithm), valid for the proleptic Gregorian calendar.
+    const int month = static_cast<int>(month_it - months.begin()) + 1;
+    const int y = year - (month <= 2 ? 1 : 0);
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const int yoe = y - era * 400;
+    const int doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const s64 days = static_cast<s64>(era) * 146097 + doe - 719468;
+    return days * 86400 + hour * 3600 + minute * 60 + second;
+}
+} // namespace
+
+std::optional<s64> FetchServerTimeSkewSeconds() {
+    const auto host_before = std::chrono::system_clock::now();
+    const auto result = Send("GET", "/api/health", {}, {});
+    const auto host_after = std::chrono::system_clock::now();
+    if (!result || !result->has_header("Date")) {
+        return std::nullopt;
+    }
+    const auto server = ParseHttpDate(result->get_header_value("Date"));
+    if (!server) {
+        LOG_WARNING(WebService, "Server time: unreadable Date header \"{}\"",
+                    result->get_header_value("Date"));
+        return std::nullopt;
+    }
+    const auto host_mid = host_before + (host_after - host_before) / 2;
+    const s64 host_s =
+        std::chrono::duration_cast<std::chrono::seconds>(host_mid.time_since_epoch()).count();
+    return *server - host_s;
 }
 
 } // namespace WebService::NextendoApi

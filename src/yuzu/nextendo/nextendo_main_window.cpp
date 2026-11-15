@@ -565,6 +565,33 @@ void MainWindow::NextendoApplyPerGameWorkarounds(u64 title_id) {
         Settings::values.rng_seed.SetGlobal(false);
         Settings::values.rng_seed.SetValue(0);
     }
+    // Splatoon 2 picks its stage rotation from the BCAT schedule and the console clock in UTC,
+    // and the server only matches players who computed the SAME rotation. A PC clock that is off
+    // in UTC (manual time with a wrong time zone, no sync) or a custom RTC left the player alone
+    // in their own lobby. Run the game on real UTC time: the server's clock, applied through the
+    // custom RTC as a per-game override (dropped again when the game closes), and any custom RTC
+    // the user set is ignored for this game.
+    if (IsSplatoon2(title_id)) {
+        std::optional<s64> skew;
+#ifdef ENABLE_WEB_SERVICE
+        skew = WebService::NextendoApi::FetchServerTimeSkewSeconds();
+#endif
+        constexpr s64 kMinSkewSeconds = 5;
+        const bool correct = skew && (*skew >= kMinSkewSeconds || *skew <= -kMinSkewSeconds);
+        Settings::values.custom_rtc_enabled.SetGlobal(false);
+        Settings::values.custom_rtc_offset.SetGlobal(false);
+        Settings::values.custom_rtc_enabled.SetValue(correct);
+        Settings::values.custom_rtc_offset.SetValue(correct ? *skew : 0);
+        if (!skew) {
+            LOG_WARNING(Frontend, "[Nextendo] Splatoon 2: server time unavailable, using the PC "
+                                  "clock (custom RTC ignored)");
+        } else if (correct) {
+            LOG_INFO(Frontend, "[Nextendo] Splatoon 2: PC clock is {} s off real UTC, correcting "
+                               "so the stage rotation matches other players", *skew);
+        } else {
+            LOG_INFO(Frontend, "[Nextendo] Splatoon 2: PC clock matches real UTC ({} s)", *skew);
+        }
+    }
 }
 
 void MainWindow::NextendoOnGameBooted(const std::string& title_name) {
