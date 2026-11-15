@@ -76,6 +76,8 @@ private:
     WebAppletVersion web_applet_version{};
     WebArgHeader web_arg_header{};
     WebArgInputTLVMap web_arg_input_tlv_map;
+    // [Nextendo] SharePostResult output TLV (0 = completed, 1 = cancelled); unset = not sent.
+    std::optional<u32> share_post_result;
 
     u64 title_id{};
     FileSys::ContentRecordType nca_type{};

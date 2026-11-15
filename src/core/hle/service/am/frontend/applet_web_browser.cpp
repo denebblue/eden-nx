@@ -589,6 +589,20 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
             tlv_count++;
         }
 
+        // 0x4 SharePostResult: what the game reads to tell a completed post from a cancelled one.
+        if (web_arg_header.shim_kind == ShimKind::Share && share_post_result) {
+            current_offset = align_offset(current_offset);
+            WebArgOutputTLV tlv{};
+            tlv.output_tlv_type = WebArgOutputTLVType::SharePostResult;
+            tlv.arg_data_size = sizeof(u32);
+            std::memcpy(out_data.data() + current_offset, &tlv, sizeof(WebArgOutputTLV));
+            current_offset += sizeof(WebArgOutputTLV);
+            const u32 post_result = *share_post_result;
+            std::memcpy(out_data.data() + current_offset, &post_result, sizeof(u32));
+            current_offset += sizeof(u32);
+            tlv_count++;
+        }
+
         WebArgHeader out_header{};
         out_header.total_tlv_entries = tlv_count;
         out_header.shim_kind = web_arg_header.shim_kind;
@@ -789,6 +803,11 @@ void WebBrowser::ExecuteShare() {
     auto reason = WebExitReason::ExitRequested;
     if (const char* env = std::getenv("NEXTENDO_SHARE_EXIT_REASON"); env && *env) {
         reason = static_cast<WebExitReason>(std::strtoul(env, nullptr, 10));
+    }
+    // libnx WebSharePostResult: 0 = Completed, 1 = Cancel. Overridable while confirming.
+    share_post_result = 0;
+    if (const char* env = std::getenv("NEXTENDO_SHARE_POST_RESULT"); env && *env) {
+        share_post_result = static_cast<u32>(std::strtoul(env, nullptr, 10));
     }
     LOG_INFO(Service_AM, "[Nextendo][Share] Posted {} ({} bytes) for {}; answering exit reason {}",
              Common::FS::PathToUTF8String(image_path.filename()), png.size(), title_id_hex,
