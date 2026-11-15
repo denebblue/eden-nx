@@ -1666,6 +1666,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
 
+    // A merge can raise a single-layer render target (layer_stride 0 = "any stride") to
+    // several layers. Left at 0, the joined image's guest size is 0 ("assert
+    // info.layer_stride != 0" flood, then a crash; Splatoon 2 leaving online matchmaking).
+    if (new_info.type != ImageType::Linear && new_info.resources.layers > 1 &&
+        new_info.layer_stride == 0) {
+        new_info.layer_stride = CalculateLayerStride(new_info);
+        new_info.maybe_unaligned_layer_stride = CalculateLayerSize(new_info);
+    }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
 
