@@ -1334,7 +1334,7 @@ std::optional<s64> ParseHttpDate(const std::string& value) {
                                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     char weekday[4]{}, month_name[4]{}, zone[4]{};
     int day = 0, year = 0, hour = 0, minute = 0, second = 0;
-    if (std::sscanf(value.c_str(), "%3s %d %3s %d %d:%d:%d %3s", weekday, &day, month_name, &year,
+    if (std::sscanf(value.c_str(), "%3s, %d %3s %d %d:%d:%d %3s", weekday, &day, month_name, &year,
                     &hour, &minute, &second, zone) != 8 ||
         std::string_view{zone} != "GMT") {
         return std::nullopt;
