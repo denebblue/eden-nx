@@ -517,8 +517,8 @@ void WebBrowser::ExtractOfflineRomFS() {
 
 void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url) {
     const bool use_tlv_output =
-        (web_arg_header.shim_kind == ShimKind::Share &&
-         web_applet_version >= WebAppletVersion::Version196608) ||
+        // [Nextendo] Share always: nn::web::ShowSharePage aborts unless it pops exactly 0x2000 bytes.
+        (web_arg_header.shim_kind == ShimKind::Share) ||
         (web_arg_header.shim_kind == ShimKind::Web &&
          web_applet_version >= WebAppletVersion::Version524288) ||
         (web_arg_header.shim_kind == ShimKind::Lhub);
