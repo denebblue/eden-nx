@@ -8,13 +8,16 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nextendo_online_tuning.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
+#include "core/hle/service/sockets/sockets.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/shader_notify.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -87,6 +90,25 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.GetPerfStats().EndSystemFrame();
     system.GetPerfStats().BeginSystemFrame();
+
+    // [Nextendo] An online match drops a player whose game stops answering for a few seconds.
+    // While an online title runs, log every frame that took far longer than it should, with the
+    // usual emulator-side causes, so a disconnect report can be matched against the emulator's
+    // own stalls (or ruled out). A pause also shows up here once, on resume.
+    const auto now = std::chrono::steady_clock::now();
+    if (Nextendo::OnlineTuning::IsActive() && last_composite) {
+        constexpr auto StallThreshold = std::chrono::milliseconds(250);
+        const auto frame = now - *last_composite;
+        if (frame >= StallThreshold) {
+            LOG_WARNING(Service_NVDRV,
+                        "[Nextendo] Frame stall: {} ms (shaders building: {}, busy socket "
+                        "threads: {}/{})",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(frame).count(),
+                        system.GPU().ShaderNotify().ShadersBuilding(),
+                        Service::Sockets::BusyBsdThreads(), Service::Sockets::BsdServiceThreads);
+        }
+    }
+    last_composite = now;
 }
 
 Kernel::KEvent* nvdisp_disp0::QueryEvent(u32 event_id) {

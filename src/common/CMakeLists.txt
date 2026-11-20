@@ -111,6 +111,7 @@ add_library(
     nextendo_friends.h
     nextendo_nat.cpp
     nextendo_nat.h
+    nextendo_online_tuning.h
     nextendo_outgoing_requests.cpp
     nextendo_outgoing_requests.h
     settings.cpp

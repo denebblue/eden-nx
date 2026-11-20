@@ -312,7 +312,14 @@ bool ServerManager::WaitAndProcessImpl() {
     }
 }
 
+void ServerManager::SetHostThreadPriority(Common::ThreadPriority priority) {
+    m_host_thread_priority = priority;
+}
+
 Result ServerManager::LoopProcessImpl() {
+    if (m_host_thread_priority) {
+        Common::SetCurrentThreadPriority(*m_host_thread_priority);
+    }
     while (!m_stop_source.stop_requested()) {
         this->WaitAndProcessImpl();
     }

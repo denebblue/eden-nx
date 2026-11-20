@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "common/common_types.h"
 #include "common/math_util.h"
@@ -42,6 +44,8 @@ public:
 private:
     NvCore::Container& container;
     NvCore::NvMap& nvmap;
+    // [Nextendo] Host time of the previous composite, for the online frame stall log.
+    std::optional<std::chrono::steady_clock::time_point> last_composite;
 };
 
 } // namespace Service::Nvidia::Devices

@@ -16,6 +16,8 @@
 #include <mutex>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1120,9 +1122,81 @@ void BSD::EventFd(HLERequestContext& ctx) {
     rb.PushEnum(Errno::SUCCESS);
 }
 
+namespace {
+
+// [Nextendo] Socket operations currently running on the bsd server's host threads, shared by the
+// bsd:s and bsd:u instances (they run on the same threads). When all of them are busy, every other
+// socket call of the title waits in line, which is how an online match stalls on the emulator's
+// side; log that moment so a disconnect report can be matched against it.
+std::atomic<int> g_busy_bsd_threads{0};
+std::mutex g_busy_bsd_mutex;
+std::unordered_map<std::thread::id, const char*> g_busy_bsd_ops;
+std::chrono::steady_clock::time_point g_last_bsd_saturation_log{};
+
+class BusyBsdThreadScope {
+public:
+    explicit BusyBsdThreadScope(const char* op) {
+        std::scoped_lock lock{g_busy_bsd_mutex};
+        g_busy_bsd_ops[std::this_thread::get_id()] = op;
+        const int busy = ++g_busy_bsd_threads;
+        if (busy < BsdServiceThreads) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_last_bsd_saturation_log < std::chrono::seconds(5)) {
+            return;
+        }
+        g_last_bsd_saturation_log = now;
+        std::vector<std::string_view> ops;
+        ops.reserve(g_busy_bsd_ops.size());
+        for (const auto& [thread_id, name] : g_busy_bsd_ops) {
+            ops.emplace_back(name);
+        }
+        LOG_WARNING(Service, "[Nextendo] All {} socket threads busy ({}): other socket calls wait",
+                    busy, fmt::join(ops, ", "));
+    }
+
+    ~BusyBsdThreadScope() {
+        std::scoped_lock lock{g_busy_bsd_mutex};
+        g_busy_bsd_ops.erase(std::this_thread::get_id());
+        --g_busy_bsd_threads;
+    }
+
+    BusyBsdThreadScope(const BusyBsdThreadScope&) = delete;
+    BusyBsdThreadScope& operator=(const BusyBsdThreadScope&) = delete;
+};
+
+} // Anonymous namespace
+
+int BusyBsdThreads() {
+    return g_busy_bsd_threads.load(std::memory_order_relaxed);
+}
+
 template <typename Work>
 void BSD::ExecuteWork(HLERequestContext& ctx, Work work) {
-    work.Execute(this);
+    {
+        // The Work types are private to BSD, so name them here rather than in a free helper.
+        const char* op = "Other";
+        if constexpr (std::is_same_v<Work, PollWork>) {
+            op = "Poll";
+        } else if constexpr (std::is_same_v<Work, SelectWork>) {
+            op = "Select";
+        } else if constexpr (std::is_same_v<Work, AcceptWork>) {
+            op = "Accept";
+        } else if constexpr (std::is_same_v<Work, ConnectWork>) {
+            op = "Connect";
+        } else if constexpr (std::is_same_v<Work, RecvWork>) {
+            op = "Recv";
+        } else if constexpr (std::is_same_v<Work, RecvFromWork>) {
+            op = "RecvFrom";
+        } else if constexpr (std::is_same_v<Work, SendWork>) {
+            op = "Send";
+        } else if constexpr (std::is_same_v<Work, SendToWork>) {
+            op = "SendTo";
+        }
+        BusyBsdThreadScope busy{op};
+        work.Execute(this);
+    }
     work.Response(ctx);
 }
 

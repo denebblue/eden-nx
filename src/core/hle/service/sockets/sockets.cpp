@@ -41,7 +41,11 @@ void LoopProcess(Core::System& system) {
     // blocks -- with only one thread, that's forever. Two extra threads gives blocking calls
     // room to sit without stalling the rest of a title's networking, without reintroducing the
     // 6-thread pool's larger ordering races.
-    server_manager->StartAdditionalHostThreads("bsdsocket", 2);
+    // [Nextendo] Socket calls are short and mostly sleep in the host's poll/recv, but when one is
+    // ready it has to run now: an online title's netcode waits on it every frame. Above-normal
+    // priority keeps them ahead of shader compilation and other host work on a busy machine.
+    server_manager->SetHostThreadPriority(Common::ThreadPriority::High);
+    server_manager->StartAdditionalHostThreads("bsdsocket", BsdServiceThreads - 1);
 
     // [Nextendo] See sockets.h's declaration comment on SetBsdDeferralEvent.
     Kernel::KEvent* deferral_event{};

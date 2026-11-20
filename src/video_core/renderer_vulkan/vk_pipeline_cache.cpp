@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/nextendo_online_tuning.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -341,6 +343,19 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
+// [Nextendo] Pipeline workers run one per host core at normal priority, so a burst of new shaders
+// takes every core away from the emulated CPU threads: the game slows down, and in an online match
+// its netcode answers late and the other players drop it. While an online title runs, build at
+// below-normal priority instead. Workers still use every idle core (the boot-time cache load is
+// as fast as before), but the scheduler always runs the emulated CPU, GPU and socket threads
+// first; with asynchronous shaders the game just draws without the new shader a little longer.
+std::optional<Common::ThreadPriority> PipelineWorkerPriority() {
+    if (Nextendo::OnlineTuning::IsActive()) {
+        return Common::ThreadPriority::Low;
+    }
+    return std::nullopt;
+}
+
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -374,8 +389,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
-              "VkPipelineBuilder"),
-      serialization_thread(1, "VkPipelineSerialization") {
+              "VkPipelineBuilder", {}, PipelineWorkerPriority()),
+      serialization_thread(1, "VkPipelineSerialization", {}, PipelineWorkerPriority()) {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     profile = Shader::Profile{

@@ -49,6 +49,9 @@ public:
 
     Result LoopProcess();
     void StartAdditionalHostThreads(const char* name, size_t num_threads);
+    // Host scheduling priority for every thread that serves this manager (its main loop and any
+    // additional host threads). Call before RunServer/StartAdditionalHostThreads.
+    void SetHostThreadPriority(Common::ThreadPriority priority);
 
     static void RunServer(std::unique_ptr<ServerManager>&& server);
 
@@ -92,6 +95,7 @@ private:
     Common::Event m_stopped{};
     std::vector<std::jthread> m_threads{};
     std::stop_source m_stop_source{};
+    std::optional<Common::ThreadPriority> m_host_thread_priority{};
 };
 
 } // namespace Service

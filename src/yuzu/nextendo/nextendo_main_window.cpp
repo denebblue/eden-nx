@@ -41,6 +41,8 @@
 #include "common/logging.h"
 #include "common/nextendo_account.h"
 #include "common/nextendo_friends.h"
+#include "common/nextendo_compatible_titles.h"
+#include "common/nextendo_online_tuning.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
@@ -545,6 +547,21 @@ bool MainWindow::NextendoBeforeBoot(u64 title_id) {
 }
 
 void MainWindow::NextendoApplyPerGameWorkarounds(u64 title_id) {
+    // An online match drops a player whose game freezes for a few seconds, and compiling shaders
+    // synchronously freezes the game for every new shader. For titles that play on Nextendo, force
+    // asynchronous shaders and the disk shader cache (per-game override, dropped again when the
+    // game closes) and let the renderer keep its shader workers off the emulated CPU's cores.
+    const bool online_title = Settings::values.enable_nextendo.GetValue() &&
+                              Nextendo::CompatibleTitles::Table().contains(title_id);
+    Nextendo::OnlineTuning::SetActive(online_title);
+    if (online_title) {
+        LOG_INFO(Frontend, "[Nextendo] Online title: forcing asynchronous shaders and the disk "
+                           "shader cache, shader workers yield to the emulated CPU");
+        Settings::values.use_asynchronous_shaders.SetGlobal(false);
+        Settings::values.use_asynchronous_shaders.SetValue(true);
+        Settings::values.use_disk_shader_cache.SetGlobal(false);
+        Settings::values.use_disk_shader_cache.SetValue(true);
+    }
     // TEMPORARY (same as Citron Nextendo): resolution scale above 1x doubles Nextendo online
     // points in Splatoon 2 and 3. Clamp to 1x until the scaling bug is fixed.
     if (IsSplatoon2(title_id) || title_id == kSplatoon3) {
@@ -617,6 +634,7 @@ void MainWindow::NextendoOnStartGame() {
 void MainWindow::NextendoOnEmulationStopped() {
     // Every shutdown path lands in OnEmulationStopped; flush the play time first.
     play_time_manager->Stop();
+    Nextendo::OnlineTuning::SetActive(false);
     SyncNextendoHistory();
     Common::NextendoFriends::SetLocalStatus(Common::NextendoFriends::PresenceOnline);
 

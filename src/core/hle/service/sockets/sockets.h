@@ -278,4 +278,10 @@ void LoopProcess(Core::System& system);
 void SetBsdDeferralEvent(Kernel::KEvent* event);
 Kernel::KEvent* GetBsdDeferralEvent();
 
+// [Nextendo] Host threads serving the bsd/nsd/sfdnsres server: its main loop plus the additional
+// threads started in sockets.cpp.
+inline constexpr int BsdServiceThreads = 3;
+// How many of those threads are inside a socket operation right now (bsd.cpp's ExecuteWork).
+int BusyBsdThreads();
+
 } // namespace Service::Sockets
